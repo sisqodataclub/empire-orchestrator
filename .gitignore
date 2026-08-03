@@ -1,0 +1,23 @@
+# Runtime state
+ai_civilization/
+agent_workspace/
+logs/
+*.log
+*.db
+session.json
+failed_commits.jsonl
+checkpoint_*.tar.gz
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+
+# Reports & output (they're generated, not source)
+*.md           # or be specific: keyword_research_report.md etc.
+
+# Docker (keep Dockerfile & compose, ignore volumes)
+.dockerignore

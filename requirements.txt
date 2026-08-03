@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+crewai
+chromadb
+sentence-transformers
+crawl4ai
+pydantic
+email-validator
+# any other packages you use, e.g.:
+jobspy

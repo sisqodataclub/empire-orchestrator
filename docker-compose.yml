@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    container_name: empire-api
+    restart: always
+    env_file:
+      - .env
+    networks:
+      - proxy_network      # so NPM can see it
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+networks:
+  proxy_network:
+    external: true         # already created by your proxy setup
