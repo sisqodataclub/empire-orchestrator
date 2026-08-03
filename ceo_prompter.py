@@ -5,7 +5,6 @@ Builds the CEO system prompt dynamically.
 - ID‑based plan with live snapshot injection
 - Graceful redirect coaching instead of hard blocks
 - FORBIDDEN: CEO uses WRITE_FILE – delegation is mandatory
-- AUTO-COMPLETION AWARE: CEO knows not to manually verify or mark tasks done
 """
 
 import os
@@ -105,7 +104,7 @@ To modify the roadmap, emit an UPDATE_PLAN action with this schema:
 }}
 """
 
-    # ── Verification Rule (✅ LOOP FIX APPLIED HERE) ──
+    # ── Verification Rule ──
     verification_protocol = f"""
 ━━━ NO TERMINAL AFTER WORKER OUTPUT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Once a worker finishes, the system AUTOMATICALLY marks their task as COMPLETED.
