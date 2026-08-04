@@ -3,6 +3,30 @@ import os
 from typing import List, Any, Optional, Dict
 from datetime import datetime
 from ceo_state import CEOScratchpad, SharedState
+from orchestration.role_tools import TOOL_REGISTRY
+
+
+def _make_tools_block(registry):
+    """Build a compact, human-readable table of all available tools."""
+    lines = [
+        "━━━ AVAILABLE WORKER EQUIPMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "When you DELEGATE a task, you MUST specify exactly which tools the worker needs",
+        "from the list below. Use the exact string names in the `assigned_tools` array.",
+        "",
+        "Tool Name           | What it does",
+        "--------------------|------------------------------------------------",
+    ]
+    for name, tool in sorted(registry.items()):
+        desc = getattr(tool, 'description', '')
+        if desc:
+            # Take the first line and shorten it to one sentence
+            first_line = desc.split('\n')[0].strip()
+            short = (first_line[:77] + '...') if len(first_line) > 80 else first_line
+        else:
+            short = "No description"
+        lines.append(f"{name:<20} | {short}")
+    return "\n".join(lines)
+
 
 def build_ceo_prompt(
     mission: str, turn: int, conversation_history: List[dict],
@@ -93,22 +117,8 @@ If a file needs to be written, you MUST use the DELEGATE tool to assign it to a 
 Always instruct the worker to write files to the mission scratch directory: {scratch_dir}
 """
 
-    # 🆕 Available Worker Equipment
-    available_tools_block = """
-━━━ AVAILABLE WORKER EQUIPMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-When you DELEGATE a task, you must specify exactly which tools the worker
-needs from the list below. Use the exact string names in the `assigned_tools` array.
-
-Tool Name           | What it does
---------------------|------------------------------------------------
-file_manager        | Read, write, and list files on disk. (Mandatory for any worker that creates a deliverable.)
-ast_inspector       | Inspect code structures and extract specific parts.
-python_repl         | Execute Python code.
-execute_terminal    | Run bash commands.
-web_search          | Search the live internet.
-web_fetch           | Fetch and extract content from a URL.
-commit_to_library   | Save a lesson to the global library.
-"""
+    # 🆕 Dynamic equipment list generated from the tool registry
+    available_tools_block = _make_tools_block(TOOL_REGISTRY)
 
     live_plan = ""
     if mission_db:

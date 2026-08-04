@@ -990,20 +990,19 @@ class ActiveTask:
                     self.logs.append("[bold red]❌ HIRE requires role, goal, backstory[/bold red]")
                 continue
 
-            # ── 🆕 UPDATED DELEGATE HANDLER (dynamic tool provisioning) ──
+            # 🆕 DYNAMIC TOOL PROVISIONING IN DELEGATE
             if action_type == "DELEGATE":
                 role = payload.get("role", "").strip()
                 instruction = payload.get("instruction", "").strip()
-                assigned_tools = payload.get("assigned_tools", ["file_manager", "ast_inspector"])  # safe default
+                assigned_tools = payload.get("assigned_tools", ["file_manager", "ast_inspector"])
 
-                # Validate against the global registry
-                valid_tools = {"file_manager", "ast_inspector", "python_repl", "execute_terminal", "web_search", "web_fetch", "commit_to_library"}
+                # Dynamic validation – automatically includes every registered tool
+                valid_tools = set(TOOL_REGISTRY.keys())
                 safe_tools = [t for t in assigned_tools if t in valid_tools]
                 if "file_manager" not in safe_tools:
                     safe_tools.append("file_manager")   # failsafe
 
                 if role and instruction:
-                    # If the agent doesn't exist, auto-hire with the requested tools
                     if not any(role.lower() in a.role.lower() for a in self.agents):
                         self.logs.append(f"[bold yellow]⚠️ Agent '{role}' not found. Auto-hiring with tools: {safe_tools}[/bold yellow]")
                         new_agent = self._spawn_agent_with_tools(role, f"Execute tasks related to {role}.", f"Expert in {role}.", safe_tools)
@@ -1011,7 +1010,6 @@ class ActiveTask:
                             self.logs.append(f"[bold red]❌ Failed to auto-hire '{role}'. Skipping delegation.[/bold red]")
                             continue
                     else:
-                        # Update the existing agent's tools for this task
                         agent_obj = next(a for a in self.agents if role.lower() in a.role.lower())
                         agent_obj.tools = [TOOL_REGISTRY[name] for name in safe_tools if name in TOOL_REGISTRY]
 
