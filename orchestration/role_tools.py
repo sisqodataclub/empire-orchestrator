@@ -16,28 +16,15 @@ def _build_tool_registry():
 
 TOOL_REGISTRY = _build_tool_registry()
 
-ROLE_TOOLS = {
-    "quality assurance engineer": {"file_manager", "execute_terminal", "ast_inspector", "commit_to_library"},
-    "seo specialist":              {"web_search", "web_fetch", "file_manager", "ast_inspector"},
-    "web developer":               {"file_manager", "execute_terminal", "ast_inspector"},
-    "data analyst":                {"file_manager", "execute_terminal", "ast_inspector", "python_repl"},
-    "research specialist":         {"web_search", "web_fetch", "file_manager", "ast_inspector"},
-}
-
 def get_tools_for_role(role: str) -> list:
-    role_lower = role.lower()
-    allowed = None
-    if role_lower in ROLE_TOOLS:
-        allowed = ROLE_TOOLS[role_lower]
-    else:
-        for known_role, tools in ROLE_TOOLS.items():
-            if known_role in role_lower:
-                allowed = tools
-                break
-    if not allowed:
-        allowed = {"file_manager", "ast_inspector"}
+    """
+    Every agent gets file_manager and ast_inspector as a minimum.
+    Additional role‑specific tools can be added here later, but never remove the basics.
+    """
+    base_tools = {"file_manager", "ast_inspector"}
+
     tools = []
-    for name in allowed:
+    for name in base_tools:
         tool = TOOL_REGISTRY.get(name)
         if tool:
             tools.append(tool)

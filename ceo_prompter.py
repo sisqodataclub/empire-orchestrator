@@ -28,14 +28,12 @@ def build_ceo_prompt(
         with open(manifest_path, "r", encoding="utf-8") as f:
             handbook = f.read()
 
-    # Agent Roster (use chr(10) instead of \n inside the f‑string)
     NEWLINE = chr(10)
     agent_roster = NEWLINE.join(
         f"• {a.role}  → Tools: {', '.join({getattr(t, 'name', getattr(t, '__name__', str(t))) for t in a.tools})}"
         for a in agents
     )
 
-    # Operational Directives
     handbook_block = (
         "=== DOMAIN KNOWLEDGE & PROJECT HANDBOOK ===" + NEWLINE +
         handbook + NEWLINE +
@@ -93,6 +91,23 @@ As Chief Architect, you are strictly an orchestrator. Your hands do not touch th
 You are FORBIDDEN from using WRITE_FILE to author reports, code, or deliverables.
 If a file needs to be written, you MUST use the DELEGATE tool to assign it to a specialist.
 Always instruct the worker to write files to the mission scratch directory: {scratch_dir}
+"""
+
+    # 🆕 Available Worker Equipment
+    available_tools_block = """
+━━━ AVAILABLE WORKER EQUIPMENT ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+When you DELEGATE a task, you must specify exactly which tools the worker
+needs from the list below. Use the exact string names in the `assigned_tools` array.
+
+Tool Name           | What it does
+--------------------|------------------------------------------------
+file_manager        | Read, write, and list files on disk. (Mandatory for any worker that creates a deliverable.)
+ast_inspector       | Inspect code structures and extract specific parts.
+python_repl         | Execute Python code.
+execute_terminal    | Run bash commands.
+web_search          | Search the live internet.
+web_fetch           | Fetch and extract content from a URL.
+commit_to_library   | Save a lesson to the global library.
 """
 
     live_plan = ""
@@ -187,6 +202,8 @@ MISSION: {mission}
 
 {delegation_policy}
 
+{available_tools_block}
+
 {live_plan}
 
 {active_task_block}
@@ -213,7 +230,7 @@ Respond ONLY in valid JSON. Use this compact schema:
   "action_payload": {{{{
     // If DEFINE_PRODUCT: {{"description": "...", "deliverable_files": ["/path/file"]}}
     // If TERMINAL: {{"commands": ["cmd1", "cmd2"]}}
-    // If DELEGATE: {{"role": "exact role name", "instruction": "Detailed task."}}
+    // If DELEGATE: {{"role": "exact role name", "instruction": "Detailed task.", "assigned_tools": ["file_manager", "web_search"]}}
     // If HIRE: {{"role": "new role", "goal": "...", "backstory": "...", "initial_instruction": "..."}}
     // If WAIT: {{"reason": "why waiting"}}
     // If FINISH: {{"report": "summary of what was accomplished"}}

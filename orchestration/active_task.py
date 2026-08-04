@@ -367,6 +367,20 @@ class ActiveTask:
         return None
 
     # ═════════════════════════════════════════════════════════════════
+    # 🆕 NEW HELPER: _spawn_agent_with_tools (dynamic provisioning)
+    # ═════════════════════════════════════════════════════════════════
+    def _spawn_agent_with_tools(self, role: str, goal: str, backstory: str, tool_names: list):
+        from gm import NativeAgent
+        tools = [TOOL_REGISTRY[name] for name in tool_names if name in TOOL_REGISTRY]
+        new_agent = NativeAgent(role, goal, backstory, tools=tools)
+        colors = ["bold cyan", "bold magenta", "bold blue", "bold green", "bold yellow"]
+        color_index = len(self.agents) % len(colors)
+        new_agent.step_callback = self.create_logger(role, colors[color_index])
+        self.agents.append(new_agent)
+        self.logs.append(f"[bold green]🧬 AGENT READY: '{role}' (tools: {tool_names})[/bold green]")
+        return new_agent
+
+    # ═════════════════════════════════════════════════════════════════
     # 🆕 STATE‑ENFORCED TOOL SCHEMAS
     # ═════════════════════════════════════════════════════════════════
     def _get_allowed_actions(self) -> List[str]:
@@ -921,7 +935,7 @@ class ActiveTask:
                     self.logs.append("[bold red]❌ UPDATE_PLAN requires phase_title and task_description[/bold red]")
                 continue
 
-            # ── All other action handlers (unchanged) ──
+            # ── All other action handlers (unchanged except DELEGATE) ──
             if action_type == "DEFINE_PRODUCT":
                 description = payload.get("description", "")
                 files = payload.get("deliverable_files", [])
@@ -976,18 +990,31 @@ class ActiveTask:
                     self.logs.append("[bold red]❌ HIRE requires role, goal, backstory[/bold red]")
                 continue
 
+            # ── 🆕 UPDATED DELEGATE HANDLER (dynamic tool provisioning) ──
             if action_type == "DELEGATE":
                 role = payload.get("role", "").strip()
                 instruction = payload.get("instruction", "").strip()
+                assigned_tools = payload.get("assigned_tools", ["file_manager", "ast_inspector"])  # safe default
+
+                # Validate against the global registry
+                valid_tools = {"file_manager", "ast_inspector", "python_repl", "execute_terminal", "web_search", "web_fetch", "commit_to_library"}
+                safe_tools = [t for t in assigned_tools if t in valid_tools]
+                if "file_manager" not in safe_tools:
+                    safe_tools.append("file_manager")   # failsafe
+
                 if role and instruction:
+                    # If the agent doesn't exist, auto-hire with the requested tools
                     if not any(role.lower() in a.role.lower() for a in self.agents):
-                        self.logs.append(f"[bold yellow]⚠️ Agent '{role}' not found. Auto-hiring...[/bold yellow]")
-                        default_goal = f"Execute tasks related to {role}."
-                        default_backstory = f"Expert in {role}."
-                        new_agent = self._spawn_agent(role, default_goal, default_backstory)
+                        self.logs.append(f"[bold yellow]⚠️ Agent '{role}' not found. Auto-hiring with tools: {safe_tools}[/bold yellow]")
+                        new_agent = self._spawn_agent_with_tools(role, f"Execute tasks related to {role}.", f"Expert in {role}.", safe_tools)
                         if not new_agent:
                             self.logs.append(f"[bold red]❌ Failed to auto-hire '{role}'. Skipping delegation.[/bold red]")
                             continue
+                    else:
+                        # Update the existing agent's tools for this task
+                        agent_obj = next(a for a in self.agents if role.lower() in a.role.lower())
+                        agent_obj.tools = [TOOL_REGISTRY[name] for name in safe_tools if name in TOOL_REGISTRY]
+
                     subordinates = [a for a in self.agents if a.role != "The Global CEO"]
                     self._dispatch_worker(role, instruction, turn, subordinates)
                     continue
