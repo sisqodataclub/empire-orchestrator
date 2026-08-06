@@ -21,3 +21,4 @@ __pycache__/
 
 # Docker (keep Dockerfile & compose, ignore volumes)
 .dockerignore
+data/
