@@ -131,12 +131,14 @@ class ActiveTask:
         colors = ["bold cyan", "bold magenta", "bold blue", "bold green", "bold yellow"]
         for i, agent in enumerate(self.agents):
             agent.step_callback = self.create_logger(agent.role, colors[i % len(colors)])
+    # Resolve tenant‑specific agent pool directory from the current working directory
+        tenant_pool_dir = os.path.abspath(os.path.join("ai_civilization", "agent_pool"))
 
         self.spawner = AgentSpawner(
             director_llm=self.director_llm,
             logger=self.logs.append,
             tools=self.agents[0].tools if self.agents else [],
-            pool_dir="ai_civilization/agent_pool"
+            pool_dir=tenant_pool_dir
         )
 
     # ════════════════════════════════════════════════════════════

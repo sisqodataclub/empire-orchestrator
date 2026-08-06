@@ -1,20 +1,59 @@
-version: '3.8'
-
 services:
-  api:
+  # ============================================================
+  # OLD SINGLE‑TENANT API (for existing clients)
+  # ============================================================
+  api-old:
     build: .
-    container_name: empire-api
+    container_name: empire-api-old
     restart: always
     env_file:
       - .env
+    ports:
+      - "8003:8000"               # avoid conflict with hvt-hvt-web-1 on 8000
     networks:
-      - proxy_network      # so NPM can see it
+      - proxy_network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
       interval: 30s
       timeout: 10s
       retries: 3
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ============================================================
+  # NEW MULTI‑TENANT API (for new clients)
+  # ============================================================
+  api-new:
+    build: .
+    container_name: empire-api-new
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=sqlite:////app/data/workspaces/tenants.db
+      - WORKSPACE_ROOT=/app/data/workspaces
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./data/workspaces:/app/data/workspaces   # stores DB and all tenant workspaces
+    networks:
+      - proxy_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"
 
 networks:
   proxy_network:
-    external: true         # already created by your proxy setup
+    external: true

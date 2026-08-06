@@ -23,26 +23,29 @@ class AgentSpawner:
     - Maps tool names to actual objects/strings for the cognitive wrapper.
     """
 
-    def __init__(self, director_llm: Any, logger: Any, tools: List[Any], pool_dir: str):
+    def __init__(self, director_llm: Any, logger: Any, tools: List[Any], pool_dir: str = ""):
         self.llm      = director_llm
         self.logger   = logger
         self.tools    = tools          # global available tools (custom Python objects)
-        self.pool_dir = pool_dir
         self.pool: Dict[str, Dict] = {}   # in‑memory cache: role_lower → DNA dict
 
-        os.makedirs(self.pool_dir, exist_ok=True)
+        # Dynamically resolve pool directory relative to the current tenant working directory
+        self._pool_dir = os.path.join(os.getcwd(), "ai_civilization", "agent_pool")
+        os.makedirs(self._pool_dir, exist_ok=True)
         self._load_pool()
 
     def _load_pool(self) -> None:
         """Load existing agent DNA from disk into memory."""
-        for fname in os.listdir(self.pool_dir):
+        if not os.path.exists(self._pool_dir):
+            return
+        for fname in os.listdir(self._pool_dir):
             if fname.endswith(".json"):
                 try:
-                    with open(os.path.join(self.pool_dir, fname), "r", encoding="utf-8") as f:
+                    with open(os.path.join(self._pool_dir, fname), "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    role_lower = data.get("role", "").lower()
-                    if role_lower:
-                        self.pool[role_lower] = data
+                        role_lower = data.get("role", "").lower()
+                        if role_lower:
+                            self.pool[role_lower] = data
                 except Exception:
                     pass
 
@@ -53,7 +56,7 @@ Create a JSON persona for a {role}.
 Available tools: ["system_terminal", "file_manager", "ast_inspector", "web_search", "web_fetch"]
 
 Format: {{ "goal": "...", "backstory": "...", "tools": ["tool_1", "tool_2"] }}
-Make the goal specific and actionable. 
+Make the goal specific and actionable.
 CRITICAL: Assign ONLY the tools strictly necessary for this role (e.g., a Copywriter does not need system_terminal).
 Return ONLY valid JSON.
 """
@@ -80,8 +83,9 @@ Return ONLY valid JSON.
 
     def _save_agent_dna(self, role: str, goal: str, backstory: str, tools: List[str]) -> None:
         """Write agent DNA (including authorized tools) to disk for future missions."""
+        os.makedirs(self._pool_dir, exist_ok=True)
         safe_name = role.replace(" ", "_").replace("/", "_") + ".json"
-        filepath = os.path.join(self.pool_dir, safe_name)
+        filepath = os.path.join(self._pool_dir, safe_name)
         dna = {
             "role": role,
             "goal": goal,
@@ -93,6 +97,7 @@ Return ONLY valid JSON.
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(dna, f, indent=4)
         self.pool[role.lower()] = dna
+        self.logger(f"[system]🧬 Persisted Agent DNA to {filepath}")
 
     def _map_tool_names_to_objects(self, tool_names: List[str]) -> List[Any]:
         """

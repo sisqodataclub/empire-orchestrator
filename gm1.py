@@ -332,10 +332,10 @@ def show_dashboard():
     else:
         for t in tasks:
             if   t.status == "COMPLETED":         style = "bold green"
-            elif t.status == "RUNNING":           style = "bold yellow"
-            elif t.status == "AWAITING_OVERLORD": style = "bold cyan"
-            elif t.status == "INTERRUPTED":       style = "bold red"
-            else:                                 style = "bold white"
+            elif t.status == "RUNNING":            style = "bold yellow"
+            elif t.status == "AWAITING_OVERLORD":  style = "bold cyan"
+            elif t.status == "INTERRUPTED":        style = "bold red"
+            else:                                  style = "bold white"
             table.add_row(
                 t.id, t.timestamp,
                 f"[{style}]{t.status}[/{style}]",
@@ -355,7 +355,7 @@ def show_dashboard():
     console.print("  [cyan]!use <template>[/cyan]         Launch a template mission")
     console.print("  [cyan]search <query>[/cyan]          Search mission history")
     console.print("  [cyan]!![/cyan]                     Repeat last mission")
-    console.print("  [red]exit[/red]                 Save state and shutdown")
+    console.print("  [red]exit[/red]                  Save state and shutdown")
 
 # ==============================================================================
 # 10. LIVE TASK VIEWER
@@ -532,34 +532,7 @@ def shutdown():
     sys.exit(0)
 
 # ==============================================================================
-# 15. HEADLESS MISSION RUNNER (NEW)
-# ==============================================================================
-def run_mission_headless(mission: str, priority: str = "normal", mcp_tools: list = None):
-    """Run a single mission without interactive UI, then exit."""
-    console.print(f"[bold blue]🚀 Running headless mission:[/bold blue] {mission[:80]}")
-    full_mission = build_mission_prompt(mission, priority=priority)
-    population = get_population(mcp_tools=mcp_tools or [])
-    console.print(f"[dim]👥 {len(population)} agents ready.[/dim]")
-
-    task_id = manager.start_mission(full_mission, population)
-    console.print(f"[green]✅ Mission #{task_id} started.[/green]")
-
-    # Wait for completion
-    task = manager.get_task(task_id)
-    while not task.is_complete:
-        time.sleep(0.5)
-
-    # Print final result
-    console.print(Panel(
-        Markdown(str(task.result)) if task.result else "[dim]No result captured.[/dim]",
-        title="📝 HEADLESS MISSION COMPLETE",
-        border_style="green"
-    ))
-    save_session()
-    sys.exit(0)
-
-# ==============================================================================
-# 16. MAIN LOOP (Interactive)
+# 15. MAIN LOOP
 # ==============================================================================
 def _main_loop(github_tools: list):
     last_mission = ""
@@ -692,7 +665,7 @@ def _main_loop(github_tools: list):
 
 
 # ==============================================================================
-# 17. ENTRYPOINT (Interactive + Headless)
+# 16. ENTRYPOINT (MCP Graceful Degradation)
 # ==============================================================================
 if __name__ == "__main__":
     clear()
@@ -714,41 +687,6 @@ if __name__ == "__main__":
         StdioServerParameters = None
         MCPServerAdapter      = None
 
-    # ── Check for headless mode ──
-    if len(sys.argv) > 1:
-        # If the first argument is a known interactive command, don't treat as headless.
-        known_commands = {"new", "!high", "!critical", "view", "parallel", "roster", "templates", "!use", "search", "!!", "exit"}
-        if sys.argv[1].lower() not in known_commands:
-            # Headless mode: run the mission and exit.
-            mission = " ".join(sys.argv[1:])
-            console.print(f"[dim]🧠 Headless mode: running mission: {mission[:80]}...[/dim]")
-            # Connect to MCP if available
-            if StdioServerParameters is None or MCPServerAdapter is None:
-                console.print("[yellow]⚠️  Running in degraded mode (no GitHub tools).[/yellow]")
-                run_mission_headless(mission, mcp_tools=[])
-            else:
-                github_params = StdioServerParameters(
-                    command="npx",
-                    args=["-y", "@modelcontextprotocol/server-github"],
-                    env={
-                        "GITHUB_PERSONAL_ACCESS_TOKEN": os.getenv("ai_mcp", ""),
-                        "PATH": os.getenv("PATH", "")
-                    }
-                )
-                try:
-                    with MCPServerAdapter(github_params) as github_tools:
-                        console.print(f"[green]✅ MCP Connected — {len(github_tools)} GitHub tools injected.[/green]")
-                        run_mission_headless(mission, mcp_tools=list(github_tools))
-                except Exception as mcp_err:
-                    console.print(f"[yellow]⚠️  GitHub MCP unavailable: {mcp_err}\nRunning without GitHub tools.[/yellow]")
-                    run_mission_headless(mission, mcp_tools=[])
-            # run_mission_headless will exit the process
-        else:
-            # The user typed an interactive command, but they also might have passed arguments.
-            # We'll just ignore extra args and run interactive.
-            pass
-
-    # ── Interactive mode ──
     console.print("[dim]🔌 Connecting to GitHub MCP Server...[/dim]")
 
     if StdioServerParameters is None or MCPServerAdapter is None:

@@ -9,3 +9,8 @@ pydantic
 email-validator
 # any other packages you use, e.g.:
 jobspy
+
+uvicorn 
+sqlalchemy 
+pydantic-settings
+jinja2
