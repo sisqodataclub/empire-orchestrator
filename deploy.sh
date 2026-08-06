@@ -4,9 +4,9 @@ set -e
 # ==========================================
 # 🔧 CONFIGURATION
 # ==========================================
-REPO_URL="https://github.com/your-username/empire_core_v2.git"   # replace with your actual repo
+REPO_URL="https://github.com/sisqodataclub/empire-orchestrator.git"
 PROJECT_DIR="/opt/empire-orchestrator"
-DOMAIN_NAME="aiapi.franciscodes.com"          # ⬅️ updated
+DOMAIN_NAME="aiapi.franciscodes.com"
 DATE=$(date +%Y%m%d_%H%M%S)
 
 # Colors
@@ -50,7 +50,12 @@ if [ ! -f ".env" ]; then
     fi
 fi
 
-# 4. Build and run
+# 4. Clean old mission state (optional – prevents stuck missions)
+echo -e "${BLUE}🧹 Cleaning old mission state...${NC}"
+rm -rf data/workspaces/org_*/ai_civilization/scratch/mission_*
+rm -f data/workspaces/org_*/ai_civilization/plan.md
+
+# 5. Build and run
 echo -e "${BLUE}🔧 Stopping old containers...${NC}"
 docker compose down --remove-orphans
 
@@ -60,15 +65,15 @@ docker compose build --no-cache
 echo -e "${BLUE}🚀 Starting containers...${NC}"
 docker compose up -d
 
-# 5. Health check
+# 6. Health check (new multi-tenant API on port 8001)
 echo -e "${BLUE}⏳ Waiting for service to become healthy...${NC}"
 for i in {1..30}; do
-    if docker ps --filter "name=empire-api" --format "{{.Status}}" | grep -q "healthy"; then
+    if docker ps --filter "name=empire-api-new" --format "{{.Status}}" | grep -q "healthy"; then
         echo -e "${GREEN}✅ Service is healthy!${NC}"
         break
     elif [ $i -eq 30 ]; then
         echo -e "${RED}❌ Service did not become healthy.${NC}"
-        docker logs empire-api --tail 50
+        docker logs empire-api-new --tail 50
         exit 1
     else
         echo -n "."
@@ -76,7 +81,7 @@ for i in {1..30}; do
     fi
 done
 
-# 6. Final instructions for Nginx Proxy Manager
+# 7. Final instructions for Nginx Proxy Manager
 echo ""
 echo -e "${GREEN}🎉 Deployment complete!${NC}"
 echo -e "${BLUE}📋 Next step in Nginx Proxy Manager:${NC}"
@@ -84,8 +89,8 @@ echo "1. Go to http://$(curl -s ifconfig.me):81"
 echo "2. Add Proxy Host:"
 echo "   - Domain: ${DOMAIN_NAME}"
 echo "   - Scheme: http"
-echo "   - Forward Hostname: empire-api"
-echo "   - Forward Port: 8000"
+echo "   - Forward Hostname: empire-api-new"
+echo "   - Forward Port: 8001"
 echo "3. SSL: Request Let's Encrypt certificate"
 echo ""
 echo -e "${GREEN}🌐 Your API will be available at https://${DOMAIN_NAME}${NC}"
