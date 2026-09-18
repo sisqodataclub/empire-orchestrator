@@ -19,7 +19,6 @@ from app.dependencies import get_current_org, get_optional_org
 from app.db.models import Organization
 from app.config import settings
 from app.services.workspace import ensure_tenant_workspace
-from telegram_db import add_bot_config, update_bot_config, get_bot_config   # <-- NEW
 import subprocess
 
 router = APIRouter()
@@ -35,10 +34,6 @@ class TerminalInputRequest(BaseModel):
 class TerminalResizeRequest(BaseModel):
     cols: int
     rows: int
-
-class TelegramConfigRequest(BaseModel):   # <-- NEW
-    bot_token: str
-    allowed_user_ids: str
 
 # -------- Helper: Rotate log files --------
 def rotate_log_if_needed(log_path: Path, max_size_mb: int = 5):
@@ -86,10 +81,10 @@ def get_tenant_agents(tenant_root: Path) -> list:
                     if role.lower() in seen:
                         continue
                     seen.add(role.lower())
-
+                    
                     # Look for authorized_tools first to match the Spawner
                     tools = data.get("authorized_tools") or data.get("capabilities") or data.get("tools") or ["web_search"]
-
+                    
                     agents.append({
                         "role": role,
                         "goal": data.get("goal", "No goal defined."),
@@ -155,7 +150,7 @@ def boot_engine(org_id: str) -> None:
     tenant_root = ensure_tenant_workspace(org_id)
     gm_path = Path(__file__).parent.parent.parent / "gm.py"
 
-    # Archiver
+    # Archiver - only required on cold boots to prevent overriding old mission_1
     old_scratch = tenant_root / "ai_civilization" / "scratch" / "mission_1"
     old_log = tenant_root / "ai_civilization" / "mission_logs" / "mission_1.json"
     old_plan = tenant_root / "ai_civilization" / "plan.md"
@@ -218,7 +213,7 @@ async def dashboard(request: Request, org: Organization = Depends(get_optional_o
 
     org_id_str = str(org.id)
 
-    # PRE-BOOT ENGINE: Start gm.py immediately on page load so it's instantly ready!
+    # 🔥 PRE-BOOT ENGINE: Start gm.py immediately on page load so it's instantly ready!
     if org_id_str not in active_terminals or active_terminals[org_id_str]["process"].poll() is not None:
         boot_engine(org_id_str)
 
@@ -292,22 +287,18 @@ async def start_mission_api(
     org: Organization = Depends(get_current_org),
 ):
     org_id = str(org.id)
-
+    
     # Failsafe: If the engine crashed in the background, reboot it
     if org_id not in active_terminals or active_terminals[org_id]["process"].poll() is not None:
         boot_engine(org_id)
         time.sleep(0.5)
 
+    # Seamlessly inject the quick prompt directly into the active engine!
     master_fd = active_terminals[org_id]["master_fd"]
-
-    # Reset the view tracker so it auto-syncs with the NEW mission
-    active_terminals[org_id]["view_sent"] = False
-
     clean_mission = req.mission.replace('\n', ' ')
-
-    # Send the raw mission text as a chat message (no 'new' prefix)
-    # gm.py now treats any unrecognized input as a chat message
-    os.write(master_fd, f"{clean_mission}\n".encode("utf-8"))
+    
+    # 💥 INJECT MAGIC: Types "new <mission>" directly into the PTY
+    os.write(master_fd, f"new {clean_mission}\n".encode("utf-8"))
 
     return {"status": "started", "organization": org.name}
 
@@ -319,7 +310,7 @@ async def stream_terminal(request: Request, org: Organization = Depends(get_curr
     # Fallback boot if needed
     if org_id not in active_terminals or active_terminals[org_id]["process"].poll() is not None:
         boot_engine(org_id)
-
+        
     async def event_generator():
         while org_id not in active_terminals:
             await asyncio.sleep(0.1)
@@ -330,6 +321,7 @@ async def stream_terminal(request: Request, org: Organization = Depends(get_curr
 
         loop = asyncio.get_running_loop()
         buffer = ""
+        streaming_started = False
 
         # Noise filter
         skip_patterns = [
@@ -355,27 +347,38 @@ async def stream_terminal(request: Request, org: Organization = Depends(get_curr
                     if not filtered_decoded:
                         continue
 
-                    # 1. STREAM IMMEDIATELY
-                    payload = json.dumps({'log': filtered_decoded})
-                    yield f"data: {payload}\n\n"
+                    buffer += filtered_decoded
 
-                    # 2. SNIFF FOR TASK ID IN THE BACKGROUND
-                    if not term_info.get("view_sent"):
-                        buffer += filtered_decoded
-                        match = re.search(r"(?:Task ID:|mission_|#)(\d+)", buffer)
-                        if match:
-                            tid = match.group(1)
-                            term_info["task_id"] = tid
-                            time.sleep(0.3)
-                            os.write(master_fd, f"view {tid}\n".encode())
-                            term_info["view_sent"] = True
-                            buffer = ""
+                    if not streaming_started:
+                        if not term_info.get("view_sent"):
+                            match = re.search(r"(?:Task ID:|mission_|#)(\d+)", buffer)
+                            if match:
+                                tid = match.group(1)
+                                term_info["task_id"] = tid
+                                time.sleep(0.3)
+                                os.write(master_fd, f"view {tid}\n".encode())
+                                term_info["view_sent"] = True
+                                streaming_started = True
+
+                                if buffer:
+                                    payload = json.dumps({'log': buffer})
+                                    yield f"data: {payload}\n\n"
+                                    buffer = ""
+                                continue
+                    else:
+                        if filtered_decoded:
+                            payload = json.dumps({'log': filtered_decoded})
+                            yield f"data: {payload}\n\n"
             except OSError:
                 break
             await asyncio.sleep(0.05)
 
-        msg = json.dumps({'log': '\r\n[Engine Terminated. Refresh page to reboot.]\r\n'})
-        yield f"data: {msg}\n\n"
+        if streaming_started:
+            msg = json.dumps({'log': '\r\n[Engine Terminated. Refresh page to reboot.]\r\n'})
+            yield f"data: {msg}\n\n"
+        else:
+            msg = json.dumps({'log': '\r\n[Engine Disconnected]\r\n'})
+            yield f"data: {msg}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -425,44 +428,6 @@ async def update_manifest(request: Request, org: Organization = Depends(get_curr
     manifest_path = tenant_root / "domain_manifest.md"
     manifest_path.write_text(new_content, encoding="utf-8")
     return {"status": "updated"}
-
-# -------- NEW: Telegram Configuration Endpoints --------
-@router.get("/telegram/config")
-async def get_telegram_config(org: Organization = Depends(get_current_org)):
-    """Retrieve the Telegram bot configuration for the current organisation."""
-    config = get_bot_config(str(org.id))
-    if not config:
-        return {"bot_token": "", "allowed_user_ids": ""}
-    return {
-        "bot_token": config["bot_token"],
-        "allowed_user_ids": config["allowed_user_ids"]
-    }
-
-@router.post("/telegram/config")
-async def save_telegram_config(
-    req: TelegramConfigRequest,
-    org: Organization = Depends(get_current_org)
-):
-    """Save or update the Telegram bot configuration for the current organisation."""
-    # Upsert: if config exists, update; else insert
-    existing = get_bot_config(str(org.id))
-    if existing:
-        updated = update_bot_config(
-            str(org.id),
-            bot_token=req.bot_token,
-            allowed_user_ids=req.allowed_user_ids,
-            api_key=org.api_key
-        )
-        if not updated:
-            raise HTTPException(status_code=500, detail="Failed to update config")
-    else:
-        add_bot_config(
-            str(org.id),
-            req.bot_token,
-            req.allowed_user_ids,
-            org.api_key
-        )
-    return {"status": "saved"}
 
 # -------- Mission Management Endpoints --------
 @router.get("/mission/{task_id}/logs")

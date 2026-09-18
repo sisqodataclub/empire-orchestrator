@@ -94,16 +94,45 @@ def _get_embedding_model():
     return _embedding_model
 
 # ChromaDB v0.4.16+ requires parameter name 'input'
+
+# ChromaDB v0.4.16+ requires parameter name 'input'
+# ─── ChromaDB 1.x-compatible embedding function ────────────────────────────
+# ChromaDB ≥1.0 calls embed_query() during .query() and embed_documents()
+# during .add()/.upsert(). Older versions only called __call__. We implement
+# all three so this object works on both.
 class EmbeddingFunction:
     def name(self) -> str:
         return "all-MiniLM-L6-v2"
 
     def __call__(self, input):
         model = _get_embedding_model()
+        if isinstance(input, str):
+            input = [input]
+        return model.encode(input, convert_to_numpy=True).tolist()
+
+    def embed_query(self, input):
+        """Required by ChromaDB 1.x for query() calls."""
+        model = _get_embedding_model()
+        if isinstance(input, str):
+            input = [input]
+        return model.encode(input, convert_to_numpy=True).tolist()
+
+    def embed_documents(self, input):
+        """Required by ChromaDB 1.x for add() / upsert() calls."""
+        model = _get_embedding_model()
+        if isinstance(input, str):
+            input = [input]
         return model.encode(input, convert_to_numpy=True).tolist()
 
 # ─── Single embedding function instance ─────────────────────────────────────
 ef = EmbeddingFunction()
+
+
+
+
+
+
+
 
 # ─── Helper to safely create a collection with our embedding ──────────────
 def _safe_get_or_create_collection(name: str):
@@ -1797,3 +1826,103 @@ def ast_inspector(path: str, mode: str = "map", target: str = ""):
     Allows importing `ast_inspector` directly from empire_tools.
     """
     return _empire_tools_instance.inspect_code(path, mode, target)
+
+
+# ==============================================================================
+# ==============================================================================
+# INBOX TOOLS – imported from tools/inbox_tools.py and attached to EmpireTools
+# so they are discovered by _load_empire_tools() in gm.py
+# ==============================================================================
+from tools.inbox_tools import (
+    read_inbox,
+    get_new_inbox_messages,
+    send_user_message,
+    ask_user,
+    set_inbox_db,
+)
+
+EmpireTools.read_inbox = staticmethod(read_inbox)
+EmpireTools.get_new_inbox_messages = staticmethod(get_new_inbox_messages)
+EmpireTools.send_user_message = staticmethod(send_user_message)
+EmpireTools.ask_user = staticmethod(ask_user)
+
+set_inbox_db = set_inbox_db
+
+
+# ==============================================================================
+# REPL TOOL – imported from tools/repl_tool.py and attached to EmpireTools
+# ==============================================================================
+from tools.repl_tool import execute_repl
+
+EmpireTools.execute_repl = staticmethod(execute_repl)
+
+
+# ==============================================================================
+# SECRET TOOLS – imported from tools/secret_tools.py and attached to EmpireTools
+# ==============================================================================
+from tools.secret_tools import (
+    set_secret,
+    get_secret,
+    list_secret_keys,
+    delete_secret,
+    set_secrets_manager,
+)
+
+EmpireTools.set_secret = staticmethod(set_secret)
+EmpireTools.get_secret = staticmethod(get_secret)
+EmpireTools.list_secret_keys = staticmethod(list_secret_keys)
+EmpireTools.delete_secret = staticmethod(delete_secret)
+
+set_secrets_manager = set_secrets_manager
+
+
+# ==============================================================================
+# SCHEDULER TOOLS – imported from tools/scheduler_tools.py
+# (Names now match the CEO prompt: add_task / list_tasks, not "Add Scheduled Task")
+# ==============================================================================
+from tools.scheduler_tools import (
+    add_project,
+    list_projects,
+    add_task,
+    list_tasks,
+    complete_task,
+    cancel_task,
+    set_scheduler_db,
+)
+
+EmpireTools.add_project = staticmethod(add_project)
+EmpireTools.list_projects = staticmethod(list_projects)
+EmpireTools.add_task = staticmethod(add_task)
+EmpireTools.list_tasks = staticmethod(list_tasks)
+EmpireTools.complete_task = staticmethod(complete_task)
+EmpireTools.cancel_task = staticmethod(cancel_task)
+
+set_scheduler_db = set_scheduler_db
+
+
+# ==============================================================================
+# LIST EMPIRE TOOLS – returns the catalog of all available tools
+# ==============================================================================
+from tools.list_tools import list_empire_tools
+
+EmpireTools.list_empire_tools = staticmethod(list_empire_tools)
+
+
+
+
+
+# ==============================================================================
+# SYSTEM OBSERVABILITY TOOLS — read / inspect live in-memory task state.
+# Only 3 tools: system_status, inspect_task, cancel_task.
+# Everything else (inbox, scheduler, logs) is queried by the CEO directly
+# via EXECUTE_REPL / EXECUTE_TERMINAL.
+# ==============================================================================
+from tools.system_observability_tools import (
+    system_status,
+    inspect_task,
+    cancel_task,
+)
+
+EmpireTools.system_status = staticmethod(system_status)
+EmpireTools.inspect_task  = staticmethod(inspect_task)
+EmpireTools.cancel_task   = staticmethod(cancel_task)

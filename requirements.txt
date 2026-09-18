@@ -1,16 +1,71 @@
+# ==============================================================================
+# empire-orchestrator — Python dependencies
+#
+# The Dockerfile pre-installs torch==2.5.1+cpu from the PyTorch CPU index so
+# pip sees it as already satisfied when it processes this file. The pin is
+# repeated here (with --extra-index-url) so the constraint is visible and so
+# transitive deps like sentence-transformers don't try to swap in a different
+# torch version. The `+cpu` suffix is mandatory — a bare `torch==2.5.1` will
+# match PyPI's GPU wheel and drag back the ~3 GB CUDA/nvidia stack.
+# ==============================================================================
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# --- PyTorch / transformers stack --------------------------------------------
+torch==2.5.1+cpu
+transformers>=5.0.0,<6.0.0
+sentence-transformers>=6.0.0,<7.0.0
+tokenizers>=0.21,<1.0
+huggingface-hub>=0.30
+safetensors>=0.4
+
+# --- Web / API ---------------------------------------------------------------
 fastapi
 uvicorn[standard]
 python-dotenv
-crewai
-chromadb
-sentence-transformers
-crawl4ai
-pydantic
-email-validator
-# any other packages you use, e.g.:
-jobspy
+requests
 
-uvicorn 
-sqlalchemy 
+# --- Agents / orchestration --------------------------------------------------
+crewai
+crewai-tools[mcp]
+# Pin mcp: crewai-tools[mcp] wants >=1.10.1, crewai pins ~=1.28.1, and without
+# a pin pip walks backward through many releases chasing a non-existent [ws]
+# extra (mcp 2.x dropped the extra, causing resolver thrash).
+mcp==1.28.1
+litellm>=1.60
+
+# --- Vector store / RAG ------------------------------------------------------
+chromadb
+rank_bm25
+numpy
+
+# --- Web crawling / scraping -------------------------------------------------
+crawl4ai
+beautifulsoup4
+lxml
+
+# --- Data / config -----------------------------------------------------------
+pydantic
 pydantic-settings
+email-validator
+sqlalchemy
 jinja2
+pyyaml
+
+# --- Jobs / scraping ---------------------------------------------------------
+jobspy
+pandas
+
+# --- Telegram ----------------------------------------------------------------
+pyTelegramBotAPI
+
+# --- Crypto / secrets --------------------------------------------------------
+cryptography
+
+# --- Console / pretty output -------------------------------------------------
+rich
+
+# --- Optional: Selenium fallback for Scrape Webpage --------------------------
+# empire_tools.scrape_webpage() tries Selenium first, falls back to requests
+# if Selenium isn't available. Include it if you want the JS-rendered path.
+selenium

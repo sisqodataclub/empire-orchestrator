@@ -5,6 +5,8 @@ import time
 import json
 import logging
 import threading
+import subprocess
+import uuid
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -18,6 +20,12 @@ from dotenv import load_dotenv
 # CORE IMPORTS
 from empire_tools import EmpireTools
 from task_manager import TaskManager
+from orchestration.inbox_db import InboxDB
+from orchestration.dynamic_tools import load_dynamic_tools
+from orchestration.scheduler_db import SchedulerDB
+from orchestration.scheduler import TaskScheduler
+from orchestration.mcp_manager import load_mcp_tools      # <-- NEW
+from tools.scheduler_tools import set_scheduler_db
 
 # ==============================================================================
 # 1. SILENCE CREWAI TELEMETRY SPAM BEFORE ANYTHING ELSE
@@ -43,10 +51,17 @@ for folder in [
     CIVILIZATION_DIR,
     os.path.join(CIVILIZATION_DIR, "mission_logs"),
     os.path.join(CIVILIZATION_DIR, "agent_memory"),
+    os.path.join(CIVILIZATION_DIR, "dynamic_tools"),
 ]:
     if not os.path.exists(folder):
         os.makedirs(folder)
         console.print(f"[dim]📁 Created: {folder}[/dim]")
+
+# ── Task Scheduler Initialization ──
+SCHEDULER_DB_PATH = os.path.join(CIVILIZATION_DIR, "scheduler.db")
+scheduler_db = SchedulerDB(SCHEDULER_DB_PATH)
+set_scheduler_db(scheduler_db)
+scheduler = TaskScheduler(SCHEDULER_DB_PATH, thread_id="scheduler")
 
 # ==============================================================================
 # 3. MISSION TEMPLATES
@@ -108,7 +123,13 @@ def _load_empire_tools() -> list:
             tools.append(obj)
     return tools
 
-all_empire_tools = _load_empire_tools()
+def _load_dynamic_tools() -> list:
+    """Load tools from the tenant's dynamic_tools directory."""
+    dynamic_dir = os.path.join(CIVILIZATION_DIR, "dynamic_tools")
+    return load_dynamic_tools(dynamic_dir)
+
+# Combine static, dynamic, and MCP tools
+all_empire_tools = _load_empire_tools() + _load_dynamic_tools() + load_mcp_tools()
 
 # Build TOOL_REGISTRY from actual tool objects (not broken imports)
 TOOL_REGISTRY: dict = {
@@ -153,26 +174,51 @@ def load_session():
 # 7. POPULATION MANAGEMENT (ROLE-BASED TOOL SEGREGATION)
 # ==============================================================================
 
-# ── Tool classification by normalized tool name ───────────────────────────
 CEO_TOOL_NAMES = {
     "list_directory",
-    "inspect_code",           # 'map' mode for structural overview
+    "inspect_code",
     "search_mission_logs",
     "search_library",
-    "spawn_agent",            # Spawn Specialist
+    "spawn_agent",
     "consult_overlord",
+    "read_inbox",
+    "get_new_inbox_messages",
+    "send_user_message",
+    "ask_user",
+    # REPL and live research tools
+    "search_web",
+    "scrape_webpage",
+    "query_docs",
+    "execute_repl",
+    # Secret management tools
+    "set_secret",
+    "get_secret",
+    "list_secret_keys",
+    "delete_secret",
+    # Scheduler / project tools
+    "add_project",
+    "list_projects",
+    "add_task",
+    "list_tasks",
+    "complete_task",
+    "cancel_task",
 }
 
-# QA Engineer always has file‑reading and verification tools
 QA_TOOL_NAMES = {
-    "manage_file",            # Read (and temporary write) for verification
-    "execute_terminal",       # Running test suites / compilers
-    "inspect_code",           # 'extract' / 'section' mode for deep checks
+    "manage_file",
+    "execute_terminal",
+    "inspect_code",
     "commit_to_library",
 }
 
+TOOL_BUILDER_TOOL_NAMES = {
+    "manage_file",
+    "execute_terminal",
+    "inspect_code",
+    "list_directory",
+}
+
 def _filter_tools_by_names(tools_list: list, allowed_names: set) -> list:
-    """Return only the tools whose normalized name is in allowed_names."""
     filtered = []
     for t in tools_list:
         t_name = getattr(t, 'name', '').lower().replace(' ', '_')
@@ -180,15 +226,41 @@ def _filter_tools_by_names(tools_list: list, allowed_names: set) -> list:
             filtered.append(t)
     return filtered
 
+def run_repl_code(code: str, timeout=5, max_output=2000) -> str:
+    """Run Python code in a subprocess with timeout and output truncation."""
+    script_id = uuid.uuid4().hex[:8]
+    script_path = f"/tmp/repl_{script_id}.py"
+    with open(script_path, "w") as f:
+        f.write(code)
+    try:
+        result = subprocess.run(
+            [sys.executable, script_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "HTTP_PROXY": "", "HTTPS_PROXY": "", "NO_PROXY": "*"}
+        )
+        output = result.stdout.strip()
+        if result.returncode != 0:
+            output += f"\n[ERROR] {result.stderr.strip()}"
+        if len(output) > max_output:
+            output = output[:max_output] + "\n...[TRUNCATED]"
+        return output
+    except subprocess.TimeoutExpired:
+        return "Error: Execution timed out after 5 seconds."
+    finally:
+        if os.path.exists(script_path):
+            os.unlink(script_path)
 
 def get_population(mcp_tools: list = None) -> list:
     if mcp_tools is None:
         mcp_tools = []
 
-    all_available = all_empire_tools + mcp_tools
+    # all_empire_tools already includes MCP tools, so we don't need to add them again
+    all_available = all_empire_tools
     agents = []
 
-    # ── 👑 THE GLOBAL CEO ──
+    # CEO
     ceo_tools = _filter_tools_by_names(all_available, CEO_TOOL_NAMES)
     emperor = NativeAgent(
         role="The Global CEO",
@@ -206,8 +278,12 @@ Use 'Inspect Code' (map mode) and 'List Directory' to map systems before delegat
 If an agent fails repeatedly, DO NOT repeat the same command.
 Invent a new technical vector. If 3 pivots fail, use 'Consult Overlord'. Never guess.
 
-🚨 DIRECTIVE 3 — ZERO HALLUCINATION:
-Never assume a file exists. Use 'List Directory' to confirm paths before any operation.
+🚨 DIRECTIVE 3 — ZERO HALLUCINATION & FACT‑CHECKING:
+Never assume a fact. For ANY factual answer (URLs, phone numbers, code details, dates, etc.), you MUST verify using available tools:
+   - Use 'Internet Search' or 'Scrape Webpage' to confirm web links or public information.
+   - Use 'Inspect Code' or 'List Directory' to verify internal files.
+   - Use 'EXECUTE_REPL' to run Python code that retrieves the exact answer (e.g., query DB, parse file).
+   When replying, cite your source or methodology (e.g., "I found this in file X via Inspect Code" or "I ran Python script to query the database and got: ...").
 
 🚨 DIRECTIVE 4 — COMPILER SEMANTICS:
 For tsc, rustc, go build — ZERO OUTPUT = ZERO ERRORS = SUCCESS.
@@ -215,12 +291,30 @@ Move to the next goal once verified.
 
 🚨 DIRECTIVE 5 — WORKER MEMORY LAW:
 Workers remember their last 3 task summaries AND their last raw command output.
-They do NOT have full terminal history.""",
+They do NOT have full terminal history.
+
+🚨 DIRECTIVE 6 — INBOX COMMUNICATION:
+Use 'Read Inbox' to check for new messages from the user.
+Use 'Send User Message' to reply. For simple conversational messages,
+reply directly without delegating or creating files.
+Use 'Ask User' only when you need clarification and must pause.
+
+🚨 DIRECTIVE 7 — DELEGATION BOUNDARY:
+- Use EXECUTE_REPL for read‑only exploration, data extraction, and verification.
+- Use DELEGATE for state‑changing work: writing code, editing files, running migrations, building features.
+
+🚨 DIRECTIVE 8 — EXTENDING THE EMPIRE:
+You may delegate to the 'Tool Builder' to create new Python tools saved in 'ai_civilization/dynamic_tools'.
+You have secret management tools and a built-in scheduler:
+  - Use 'add_project' to group related tasks.
+  - Use 'add_task' to schedule future work, with optional 'project_id' and 'depends_on_task_id'.
+  - The scheduler runs in the background and will wake you when tasks are due or dependencies are satisfied.
+""",
         tools=ceo_tools
     )
     agents.append(emperor)
 
-    # ── 🛡️ QUALITY ASSURANCE ENGINEER ──
+    # QA
     qa_tools = _filter_tools_by_names(all_available, QA_TOOL_NAMES)
     qa_agent = NativeAgent(
         role="Quality Assurance Engineer",
@@ -242,7 +336,17 @@ When verifying file edits, write a temporary verify.py, execute it, and report t
     )
     agents.append(qa_agent)
 
-    # ── 🧬 DYNAMIC DNA-LOADED SUBORDINATES ──
+    # Tool Builder
+    tool_builder_tools = _filter_tools_by_names(all_available, TOOL_BUILDER_TOOL_NAMES)
+    tool_builder = NativeAgent(
+        role="Tool Builder",
+        goal="Build and register new Python tools for the empire's dynamic tool directory.",
+        backstory="""You create reusable tools that other agents can use. Write @tool-decorated functions and save them in the 'ai_civilization/dynamic_tools' directory. After saving, the tool becomes available in future missions automatically.""",
+        tools=tool_builder_tools
+    )
+    agents.append(tool_builder)
+
+    # DNA-loaded agents
     json_files = [f for f in os.listdir(CIVILIZATION_DIR) if f.endswith(".json")]
     for filename in json_files:
         try:
@@ -253,13 +357,12 @@ When verifying file edits, write a temporary verify.py, execute it, and report t
                 continue
 
             agent_specific_tools = []
-            # Load tools explicitly listed in the DNA capabilities
             for cap in dna.get("capabilities", []):
                 normalized_cap = cap.lower().replace(' ', '_')
                 if normalized_cap in TOOL_REGISTRY:
                     agent_specific_tools.append(TOOL_REGISTRY[normalized_cap])
 
-            # External MCP tools (GitHub, etc.) remain available to execution workers
+            # DNA agents automatically get all MCP tools
             if mcp_tools:
                 agent_specific_tools.extend(mcp_tools)
 
@@ -282,7 +385,7 @@ When verifying file edits, write a temporary verify.py, execute it, and report t
     return agents
 
 # ==============================================================================
-# 8. MISSION PROMPT BUILDER (Conditional — no bloat on simple tasks)
+# 8. MISSION PROMPT BUILDER
 # ==============================================================================
 DESTRUCTIVE_KEYWORDS = {
     "deploy", "delete", "remove", "drop", "modify", "update", "fix",
@@ -307,7 +410,43 @@ def build_mission_prompt(mission: str, priority: str = "normal") -> str:
     return base
 
 # ==============================================================================
-# 9. UI HELPERS
+# 9. START CHAT MISSION (Inbox-aware)
+# ==============================================================================
+def start_chat_mission(raw_mission: str, priority: str = "normal", mcp_tools: list = None, thread_id: str = "console"):
+    """
+    Create an inbox item, enrich the mission text with message_id and chat instructions,
+    then start a mission via TaskManager. Returns task_id.
+    """
+    inbox_db_path = os.path.join(os.getcwd(), "ai_civilization", "inbox.db")
+    inbox_db = InboxDB(inbox_db_path)
+
+    msg_id = inbox_db.add_message(
+        thread_id=thread_id,
+        direction="IN",
+        body=raw_mission,
+        sender="user",
+        recipient="CEO",
+        status="NEW"
+    )
+
+    mission_text = (
+        f"Process inbox message #{msg_id} in thread {thread_id}.\n"
+        f"User message: {raw_mission}\n"
+        f"Instructions:\n"
+        f"- This is a chat message from the user.\n"
+        f"- If the message is simple or conversational, reply directly using SEND_REPLY with message_id={msg_id} and your reply body.\n"
+        f"- If the user is asking for a complex task, you may delegate work, but your final output must be a reply via SEND_REPLY.\n"
+        f"- Do NOT define products, create plans, or run terminal commands unless the user explicitly requests a technical task.\n"
+        f"- For factual queries, you MUST use EXECUTE_REPL, Internet Search, or Inspect Code to verify before replying."
+    )
+
+    full_mission = build_mission_prompt(mission_text, priority=priority)
+    population = get_population(mcp_tools=mcp_tools or [])
+    task_id = manager.start_mission(full_mission, population)
+    return task_id
+
+# ==============================================================================
+# 10. UI HELPERS
 # ==============================================================================
 def clear():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -316,49 +455,22 @@ def show_dashboard():
     clear()
     console.print(Panel.fit(
         "[bold red]⚔️  GLOBAL DOMINANCE SYSTEM  ⚔️[/bold red]\n"
-        "[dim]AGI Director — Native Architecture v4[/dim]",
+        "[dim]Chat with the CEO — just type a message[/dim]",
         border_style="red"
     ))
-
-    table = Table(show_header=True, header_style="bold magenta", expand=True, box=None)
-    table.add_column("ID",      style="dim",   width=4)
-    table.add_column("Time",                   width=8)
-    table.add_column("Status",                 width=18)
-    table.add_column("Mission", style="cyan")
-
-    tasks = manager.list_tasks()
-    if not tasks:
-        table.add_row("-", "-", "[dim]IDLE[/dim]", "[dim]No active missions[/dim]")
-    else:
-        for t in tasks:
-            if   t.status == "COMPLETED":         style = "bold green"
-            elif t.status == "RUNNING":            style = "bold yellow"
-            elif t.status == "AWAITING_OVERLORD":  style = "bold cyan"
-            elif t.status == "INTERRUPTED":        style = "bold red"
-            else:                                  style = "bold white"
-            table.add_row(
-                t.id, t.timestamp,
-                f"[{style}]{t.status}[/{style}]",
-                t.mission[:65]
-            )
-
-    console.print(table)
+    console.print("[dim]Commands:[/dim]")
+    console.print("  [cyan]view <id>[/cyan]        View a mission log")
+    console.print("  [cyan]parallel[/cyan]         View all running missions")
+    console.print("  [cyan]roster[/cyan]           Show agent population")
+    console.print("  [cyan]templates[/cyan]       List mission templates")
+    console.print("  [cyan]!use <template>[/cyan]  Launch a template")
+    console.print("  [cyan]search <query>[/cyan]   Search mission history")
+    console.print("  [red]exit[/red]              Save and shutdown")
     console.print()
-    console.print("[bold]COMMANDS:[/bold]")
-    console.print("  [green]new <mission>[/green]          Start a new mission")
-    console.print("  [green]!high <mission>[/green]        Start with full safety protocols")
-    console.print("  [green]!critical <mission>[/green]    Start with max priority")
-    console.print("  [cyan]view <id>[/cyan]               Live feed + intervention")
-    console.print("  [cyan]parallel[/cyan]                View all running missions")
-    console.print("  [cyan]roster[/cyan]                  Show agent population")
-    console.print("  [cyan]templates[/cyan]              List mission templates")
-    console.print("  [cyan]!use <template>[/cyan]         Launch a template mission")
-    console.print("  [cyan]search <query>[/cyan]          Search mission history")
-    console.print("  [cyan]!![/cyan]                     Repeat last mission")
-    console.print("  [red]exit[/red]                  Save state and shutdown")
+    console.print("[bold]Type your message and press Enter.[/bold]")
 
 # ==============================================================================
-# 10. LIVE TASK VIEWER
+# 11. LIVE TASK VIEWER (unchanged)
 # ==============================================================================
 def view_task_live(task_id: str):
     task = manager.get_task(task_id)
@@ -382,7 +494,6 @@ def view_task_live(task_id: str):
                     console.print(log)
                 current_log_index = len(task.logs)
 
-            # Auto-prompt when CEO is waiting for Overlord
             if task.status == "AWAITING_OVERLORD":
                 console.print(
                     "\n[bold cyan]🤔 CEO IS WAITING FOR YOUR INPUT.[/bold cyan]"
@@ -404,7 +515,7 @@ def view_task_live(task_id: str):
                         border_style="green"
                     ))
                 save_session()
-                console.print("\n[dim]Press Enter to return to dashboard...[/dim]")
+                console.print("\n[dim]Press Enter to return...[/dim]")
                 input()
                 return
 
@@ -426,7 +537,7 @@ def view_task_live(task_id: str):
             return
 
 # ==============================================================================
-# 11. PARALLEL MISSION VIEWER
+# 12. PARALLEL MISSION VIEWER (unchanged)
 # ==============================================================================
 def view_parallel():
     running = [t for t in manager.list_tasks() if t.status == "RUNNING"]
@@ -466,7 +577,7 @@ def view_parallel():
         return
 
 # ==============================================================================
-# 12. AGENT ROSTER VIEWER
+# 13. AGENT ROSTER VIEWER (unchanged)
 # ==============================================================================
 def show_roster(mcp_tools: list = None):
     population = get_population(mcp_tools=mcp_tools or [])
@@ -493,7 +604,7 @@ def show_roster(mcp_tools: list = None):
     console.input("\nPress Enter to return...")
 
 # ==============================================================================
-# 13. MISSION SEARCH
+# 14. MISSION SEARCH (unchanged)
 # ==============================================================================
 def search_missions(query: str):
     query   = query.lower().strip()
@@ -514,7 +625,7 @@ def search_missions(query: str):
     console.input("\nPress Enter to continue...")
 
 # ==============================================================================
-# 14. GRACEFUL SHUTDOWN
+# 15. GRACEFUL SHUTDOWN (unchanged)
 # ==============================================================================
 def shutdown():
     console.print("\n[bold red]⚡ SHUTDOWN INITIATED...[/bold red]")
@@ -532,54 +643,51 @@ def shutdown():
     sys.exit(0)
 
 # ==============================================================================
-# 15. MAIN LOOP
+# 16. HEADLESS MISSION RUNNER (unchanged)
+# ==============================================================================
+def run_mission_headless(mission: str, priority: str = "normal", mcp_tools: list = None):
+    console.print(f"[bold blue]🚀 Running headless mission:[/bold blue] {mission[:80]}")
+    task_id = start_chat_mission(mission, priority=priority, mcp_tools=mcp_tools or [], thread_id="headless")
+    console.print(f"[green]✅ Mission #{task_id} started.[/green]")
+    task = manager.get_task(task_id)
+    while not task.is_complete:
+        time.sleep(0.5)
+    console.print(Panel(
+        Markdown(str(task.result)) if task.result else "[dim]No result captured.[/dim]",
+        title="📝 HEADLESS MISSION COMPLETE",
+        border_style="green"
+    ))
+    save_session()
+    sys.exit(0)
+
+# ==============================================================================
+# 17. MAIN LOOP (Chat Interface) (unchanged)
 # ==============================================================================
 def _main_loop(github_tools: list):
-    last_mission = ""
     load_session()
 
     while True:
         show_dashboard()
         try:
-            raw   = console.input("\n[bold white]OVERLORD > [/bold white]").strip()
+            raw = console.input("\n[bold white]YOU > [/bold white]").strip()
             if not raw:
                 continue
 
-            cmd   = raw
-            lower = cmd.lower()
+            lower = raw.lower()
 
-            # ── EXIT ──
             if lower == "exit":
                 shutdown()
-
-            # ── REPEAT LAST ──
-            elif lower == "!!":
-                if last_mission:
-                    cmd   = f"new {last_mission}"
-                    lower = cmd.lower()
-                else:
-                    console.print("[dim]No previous mission to repeat.[/dim]")
-                    time.sleep(1)
-                    continue
-
-            # ── VIEW TASK ──
-            if lower.startswith("view "):
-                parts = cmd.split()
+            elif lower.startswith("view "):
+                parts = raw.split()
                 if len(parts) >= 2:
                     view_task_live(parts[1])
                 continue
-
-            # ── PARALLEL VIEW ──
             elif lower == "parallel":
                 view_parallel()
                 continue
-
-            # ── ROSTER ──
             elif lower == "roster":
                 show_roster(github_tools)
                 continue
-
-            # ── TEMPLATES ──
             elif lower == "templates":
                 table = Table(
                     title="📋 MISSION TEMPLATES",
@@ -594,68 +702,29 @@ def _main_loop(github_tools: list):
                 console.print("[dim]Launch with: !use <key>[/dim]")
                 console.input("\nPress Enter to continue...")
                 continue
-
-            # ── USE TEMPLATE ──
             elif lower.startswith("!use "):
-                key = cmd[5:].strip().lower()
+                key = raw[5:].strip().lower()
                 if key not in MISSION_TEMPLATES:
                     console.print(f"[red]Unknown template '{key}'. Run 'templates' to see options.[/red]")
                     time.sleep(1.5)
                     continue
-                mission      = MISSION_TEMPLATES[key]
-                full_mission = build_mission_prompt(mission, priority="high")
-                last_mission = mission
-                population   = get_population(mcp_tools=github_tools)
-                new_id       = manager.start_mission(full_mission, population)
+                mission = MISSION_TEMPLATES[key]
+                new_id = start_chat_mission(mission, priority="high", mcp_tools=github_tools, thread_id="console")
                 save_session()
                 console.print(f"[green]🚀 Mission #{new_id} launched from template '{key}'![/green]")
                 time.sleep(0.8)
                 view_task_live(new_id)
                 continue
-
-            # ── SEARCH ──
             elif lower.startswith("search "):
-                search_missions(cmd[7:])
+                search_missions(raw[7:])
                 continue
-
-            # ── NEW MISSION ──
-            elif (
-                lower.startswith("new ")
-                or lower.startswith("!high ")
-                or lower.startswith("!critical ")
-            ):
-                if lower.startswith("new "):
-                    priority = "normal"
-                    mission  = cmd[4:]
-                elif lower.startswith("!high "):
-                    priority = "high"
-                    mission  = cmd[6:]
-                else:
-                    priority = "critical"
-                    mission  = cmd[10:]
-
-                mission      = mission.strip()
-                full_mission = build_mission_prompt(mission, priority=priority)
-                last_mission = mission
-
-                console.print("[dim]🏛️  Assembling Empire population...[/dim]")
-                population = get_population(mcp_tools=github_tools)
-                console.print(f"[dim]👥 {len(population)} agents ready.[/dim]")
-
-                new_id = manager.start_mission(full_mission, population)
-                save_session()
-                console.print(
-                    f"[green]🚀 Mission #{new_id} launched! (Priority: {priority.upper()})[/green]"
-                )
-                time.sleep(0.8)
-                view_task_live(new_id)
-
             else:
-                console.print(
-                    f"[dim red]Unknown command: '{cmd}'. "
-                    f"Type 'new <mission>' to start or 'exit' to quit.[/dim red]"
-                )
-                time.sleep(1.5)
+                console.print("[dim]🏛️  CEO is processing...[/dim]")
+                new_id = start_chat_mission(raw, priority="normal", mcp_tools=github_tools, thread_id="console")
+                save_session()
+                console.print(f"[green]✅ Mission #{new_id} started.[/green]")
+                time.sleep(0.5)
+                view_task_live(new_id)
 
         except KeyboardInterrupt:
             shutdown()
@@ -663,9 +732,8 @@ def _main_loop(github_tools: list):
             console.print(f"[bold red]SYSTEM ERROR: {e}[/bold red]")
             time.sleep(2)
 
-
 # ==============================================================================
-# 16. ENTRYPOINT (MCP Graceful Degradation)
+# 18. ENTRYPOINT (Interactive + Headless) (simplified)
 # ==============================================================================
 if __name__ == "__main__":
     clear()
@@ -674,56 +742,26 @@ if __name__ == "__main__":
         border_style="dim red"
     ))
 
-    # ── Heavy imports deferred here so the console appears immediately ──
     console.print("[dim]⏳ Loading AI libraries (litellm, crewai, sentence-transformers)...[/dim]")
     console.print("[dim]   This takes 20-60 seconds on first run. Do NOT press Ctrl+C.[/dim]")
 
+    # Start scheduler in background
+    scheduler.start()
+    console.print("[dim]📅 Task scheduler started.[/dim]")
+
+    # MCP tools are already loaded at import time; no need to connect here.
+
+    if len(sys.argv) > 1:
+        known_commands = {"view", "parallel", "roster", "templates", "!use", "search", "exit"}
+        if sys.argv[1].lower() not in known_commands:
+            mission = " ".join(sys.argv[1:])
+            console.print(f"[dim]🧠 Headless mode: running mission: {mission[:80]}...[/dim]")
+            run_mission_headless(mission)
+            sys.exit(0)
+
+    # Interactive mode
+    console.print("[dim]🔌 Starting interactive mode...[/dim]")
     try:
-        from mcp import StdioServerParameters
-        from crewai_tools import MCPServerAdapter
-        console.print("[dim]✅ Libraries loaded.[/dim]")
-    except Exception as import_err:
-        console.print(f"[yellow]⚠️  MCP import failed: {import_err}\nRunning without GitHub tools.[/yellow]")
-        StdioServerParameters = None
-        MCPServerAdapter      = None
-
-    console.print("[dim]🔌 Connecting to GitHub MCP Server...[/dim]")
-
-    if StdioServerParameters is None or MCPServerAdapter is None:
-        console.print("[yellow]⚠️  Running in degraded mode (no GitHub tools).[/yellow]")
-        time.sleep(1)
-        try:
-            _main_loop([])
-        except KeyboardInterrupt:
-            shutdown()
-    else:
-        github_params = StdioServerParameters(
-            command="npx",
-            args=["-y", "@modelcontextprotocol/server-github"],
-            env={
-                "GITHUB_PERSONAL_ACCESS_TOKEN": os.getenv("ai_mcp", ""),
-                "PATH": os.getenv("PATH", "")
-            }
-        )
-
-        try:
-            with MCPServerAdapter(github_params) as github_tools:
-                console.print(
-                    f"[green]✅ MCP Connected — {len(github_tools)} GitHub tools injected.[/green]"
-                )
-                time.sleep(1)
-                _main_loop(list(github_tools))
-
-        except KeyboardInterrupt:
-            shutdown()
-
-        except Exception as mcp_err:
-            console.print(
-                f"[yellow]⚠️  GitHub MCP unavailable: {mcp_err}\n"
-                f"Running in degraded mode (no GitHub tools).[/yellow]"
-            )
-            time.sleep(2)
-            try:
-                _main_loop([])
-            except KeyboardInterrupt:
-                shutdown()
+        _main_loop([])   # tools are now global, no need to pass
+    except KeyboardInterrupt:
+        shutdown()
