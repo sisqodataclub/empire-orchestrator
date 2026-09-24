@@ -1,38 +1,43 @@
 # tools/system_observability_tools.py
 """
-Minimal system observability tools for the CEO.
+System awareness tools for the CEO.
 
-Design principle: the CEO already has EXECUTE_REPL and EXECUTE_TERMINAL,
-so he can read any SQLite DB and grep any log file himself. The only state
-that SQL/shell CANNOT reach is *in-memory Python state* — heartbeats,
-live task objects, running threads.
+The old version of this file read live state from TaskManager (heartbeats,
+ActiveTask objects, scheduler queue). None of that exists in the new
+architecture. The new sources of truth are:
 
-This module exposes exactly three tools for that in-memory layer:
+    orchestration/agents.py         — the agent registry + tool registry
+    agents/<name>/logs/tools.log    — per-agent tool trail
+    ai_civilization/inbox.db        — every message the system has seen
 
-    system_status()          → composite: tasks + inbox + scheduler + recent errors
-    inspect_task(task_id)    → deep dive on one running mission
-    cancel_task(task_id)     → mutate a live task object to stop its loop
+Three tools give the CEO a 360 view of runtime state:
 
-Everything else — inbox queries, scheduler queries, log greps — the CEO
-does via EXECUTE_REPL / EXECUTE_TERMINAL. The ceo_prompter teaches him the
-schema so he knows what to query.
+    system_status()             — composite: agents + inbox + errors
+    list_agents()               — roster with last-activity per agent
+    think(thought)              — record reasoning into the tool log
+
+Note: `read_inbox` is NOT here. That name belongs to tools/inbox_tools.py,
+which is the CEO's tool for reading user-facing inbox threads. Two
+modules exporting the same name would clobber each other in the
+EmpireTools registry.
+
+`set_observability_context()` is kept as a no-op so any old caller still
+importing it doesn't crash. The new system wires nothing through it —
+the tools read from the sources above directly.
 """
 import os
-import json
 import sqlite3
-import subprocess
+from datetime import datetime
 from typing import Optional
 
 from crewai.tools import tool
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Module-level context — injected by gm.py / org_bot_worker.py after init
+# Legacy context hook (kept as a no-op for backwards compatibility)
 # ══════════════════════════════════════════════════════════════════════
-_task_manager = None
-_log_path: Optional[str] = None
 _inbox_db_path: Optional[str] = None
-_scheduler_db_path: Optional[str] = None
+_log_path: Optional[str] = None
 
 
 def set_observability_context(
@@ -42,17 +47,12 @@ def set_observability_context(
     scheduler_db_path: Optional[str] = None,
     **_ignored,
 ) -> None:
-    """
-    Wire the live singletons that the in-memory tools need.
-
-    Only `task_manager` is required. The path arguments default to the
-    standard locations under ./ai_civilization/ and ./logs/.
-    """
-    global _task_manager, _log_path, _inbox_db_path, _scheduler_db_path
-    _task_manager = task_manager
-    _log_path = log_path
-    _inbox_db_path = inbox_db_path
-    _scheduler_db_path = scheduler_db_path
+    """No-op. The new system doesn't need external wiring."""
+    global _inbox_db_path, _log_path
+    if inbox_db_path:
+        _inbox_db_path = inbox_db_path
+    if log_path:
+        _log_path = log_path
 
 
 def _inbox_path() -> str:
@@ -61,18 +61,10 @@ def _inbox_path() -> str:
     )
 
 
-def _sched_path() -> str:
-    return _scheduler_db_path or os.path.join(
-        os.getcwd(), "ai_civilization", "scheduler.db"
-    )
-
-
-def _log_file() -> str:
-    return _log_path or os.path.join(os.getcwd(), "logs", "empire.log")
-
-
+# ══════════════════════════════════════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════════════════════════════════════
 def _safe_sqlite(db_path: str, query: str, params: tuple = ()) -> list:
-    """Read-only SQLite helper. Returns [] on any failure."""
     try:
         con = sqlite3.connect(db_path)
         rows = con.execute(query, params).fetchall()
@@ -82,216 +74,233 @@ def _safe_sqlite(db_path: str, query: str, params: tuple = ()) -> list:
         return []
 
 
-def _safe_shell(cmd: str) -> str:
-    """Run a shell command, return stdout (or error string) truncated."""
+def _agent_registry() -> dict:
+    """Lazy import of the live registry."""
     try:
-        out = subprocess.getoutput(cmd)
-        return out[:4000] if out else ""
-    except Exception as e:
-        return f"(shell error: {e})"
+        from orchestration import agents as _agents
+        return _agents.AGENTS
+    except Exception:
+        return {}
+
+
+def _tool_count() -> int:
+    """How many tools are in the shared registry."""
+    try:
+        from orchestration import agents as _agents
+        return len(_agents.TOOL_REGISTRY)
+    except Exception:
+        return 0
+
+
+def _logs_dir(agent_name: str) -> str:
+    try:
+        from orchestration import agents as _agents
+        return _agents.logs_dir(agent_name)
+    except Exception:
+        return os.path.join(
+            os.getcwd(), "ai_civilization", "agents", agent_name, "logs"
+        )
+
+
+def _last_activity(agent_name: str) -> tuple:
+    """
+    Return (human_str, seconds_ago or None) for the agent's tools.log.
+    """
+    path = os.path.join(_logs_dir(agent_name), "tools.log")
+    if not os.path.exists(path):
+        return ("never", None)
+    try:
+        mtime = os.path.getmtime(path)
+        delta = datetime.now().timestamp() - mtime
+        if delta < 60:
+            return (f"{int(delta)}s ago", int(delta))
+        if delta < 3600:
+            return (f"{int(delta/60)}m ago", int(delta))
+        return (f"{int(delta/3600)}h ago", int(delta))
+    except Exception:
+        return ("?", None)
+
+
+def _recent_errors(limit: int = 5) -> list:
+    """Scan every agent's tools.log for lines with kind='error'."""
+    errors = []
+    for name in _agent_registry():
+        path = os.path.join(_logs_dir(name), "tools.log")
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f.readlines()[-200:]:
+                    if "  error     " in line:
+                        errors.append((line.rstrip(), name))
+        except Exception:
+            pass
+    return errors[-limit:]
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TOOL 1 — Composite status snapshot
+# TOOL 1 — composite system status
 # ══════════════════════════════════════════════════════════════════════
-
 @tool("System Status")
 def system_status() -> str:
     """
-    One-shot composite overview of the entire ecosystem:
-    active missions, inbox backlog, scheduler queue, recent log warnings.
+    One-shot overview of the whole system: registered agents, shared
+    tool count, recent inbox traffic, recent errors.
 
-    Use this FIRST whenever the user asks:
-      • "what's happening?"
-      • "any updates?"
-      • "is anything stuck?"
+    Use this FIRST when the user asks anything about the state of the
+    system itself:
+      • "what are you working on?"
+      • "is anything running?"
+      • "what happened recently?"
       • "is the system okay?"
 
-    For deeper queries (specific messages, custom SQL, log greps), follow
-    up with EXECUTE_REPL / EXECUTE_TERMINAL — you have direct DB and log
-    access.
+    For deeper digging use read_inbox(), read_agent_log(), or
+    execute_terminal directly.
     """
     parts = []
+    parts.append("═══ SYSTEM STATUS ═══")
+    parts.append(f"Time:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    try:
+        from orchestration import agents as _agents
+        parts.append(f"Workspace: {_agents.WORKSPACE_DIR}")
+    except Exception:
+        parts.append(f"Workspace: {os.getcwd()}")
+    parts.append(f"Tools:     {_tool_count()} registered (shared by all agents)")
+    parts.append("")
 
-    # ── Missions (from in-memory TaskManager) ──
-    parts.append("═══ ACTIVE MISSIONS ═══")
-    if _task_manager is None:
-        parts.append("  (TaskManager not wired — call set_observability_context)")
+    # ── Agents ──
+    registry = _agent_registry()
+    parts.append("── AGENTS ──")
+    if not registry:
+        parts.append("  (no agents registered)")
     else:
-        snapshot = _task_manager.health_snapshot()
-        if not snapshot:
-            parts.append("  No tasks registered.")
-        else:
-            running = [t for t in snapshot if t["status"] == "RUNNING"]
-            stuck   = [t for t in snapshot if t["is_stuck"]]
-            parts.append(
-                f"  Running: {len(running)}   Stuck: {len(stuck)}   "
-                f"Tracked total: {len(snapshot)}"
-            )
-            # Show all running tasks (up to 10)
-            for t in running[:10]:
-                flag = "  ⚠️ STUCK" if t["is_stuck"] else ""
-                parts.append(
-                    f"    #{t['id']:<3} age={t['seconds_since_heartbeat']:>4}s "
-                    f"runtime={t['runtime_sec']:>4}s  "
-                    f"step='{t['step'][:45]}'{flag}"
-                )
-            # If any stuck, show them even if not in running[:10]
-            for t in stuck:
-                if t not in running[:10]:
-                    parts.append(
-                        f"    #{t['id']:<3} [STUCK] age={t['seconds_since_heartbeat']}s "
-                        f"step='{t['step'][:45]}'"
-                    )
+        for name, cfg in sorted(registry.items()):
+            role = cfg.get("role", "?")
+            tag = " (CEO)" if cfg.get("is_ceo") else ""
+            last, secs = _last_activity(name)
+            active = " *active*" if (secs is not None and secs < 60) else ""
+            parts.append(f"  {name}{tag} — {role}")
+            parts.append(f"    last: {last}{active}")
+    parts.append("")
 
-    # ── Inbox (per-thread summary) ──
-    parts.append("\n═══ INBOX (per-thread) ═══")
+    # ── Inbox: last 10 rows across all threads ──
+    parts.append("── INBOX (last 10 rows) ──")
     rows = _safe_sqlite(
         _inbox_path(),
-        "SELECT thread_id, direction, status, COUNT(*) "
-        "FROM inbox GROUP BY thread_id, direction, status "
-        "ORDER BY thread_id",
+        "SELECT id, thread_id, sender, substr(body, 1, 90) "
+        "FROM inbox ORDER BY id DESC LIMIT 10",
     )
     if not rows:
-        parts.append("  Empty or unreadable.")
+        parts.append("  (inbox empty or unreadable)")
     else:
-        by_thread: dict = {}
-        for thread, direction, status, count in rows:
-            by_thread.setdefault(thread, []).append((direction, status, count))
-        for thread, entries in by_thread.items():
-            summary = ", ".join(f"{d}/{s}={c}" for d, s, c in entries)
-            parts.append(f"  {thread}: {summary}")
-            pending = sum(c for d, s, c in entries if s == "PENDING_DELIVERY")
-            if pending > 5:
-                parts.append(
-                    f"    ⚠️ {pending} undelivered — poller may be behind"
-                )
+        for row_id, thread, sender, body in rows:
+            body = (body or "").replace("\n", " ")
+            parts.append(f"  #{row_id:>4}  [{thread}]  {sender}:  {body}")
+    parts.append("")
 
-    # ── Scheduler ──
-    parts.append("\n═══ SCHEDULER ═══")
-    rows = _safe_sqlite(
-        _sched_path(),
-        "SELECT status, COUNT(*) FROM scheduled_tasks GROUP BY status",
-    )
-    if not rows:
-        parts.append("  No scheduled tasks.")
+    # ── Recent errors ──
+    parts.append("── RECENT ERRORS ──")
+    errs = _recent_errors(limit=5)
+    if not errs:
+        parts.append("  (none)")
     else:
-        for status, count in rows:
-            parts.append(f"  {status}: {count}")
-
-    # ── Recent warnings in the log ──
-    parts.append("\n═══ RECENT WARNINGS ═══")
-    log_path = _log_file()
-    if not os.path.exists(log_path):
-        parts.append(f"  (log not found at {log_path})")
-    else:
-        warnings = _safe_shell(
-            f"tail -200 {log_path} | grep -iE 'error|stuck|failed|timeout' | tail -8"
-        )
-        parts.append(f"  {warnings}" if warnings.strip() else "  None in last 200 lines.")
+        for line, name in errs:
+            parts.append(f"  [{name}]  {line}")
 
     return "\n".join(parts)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TOOL 2 — Inspect a single mission (live in-memory state)
+# TOOL 2 — detailed agent roster
 # ══════════════════════════════════════════════════════════════════════
-
-@tool("Inspect Task")
-def inspect_task(task_id: str) -> str:
+@tool("List Agents")
+def list_agents() -> str:
     """
-    Deep dive on a single running mission. Returns:
-      • status, complete flag, mission text
-      • live health: current step, last heartbeat, runtime
-      • last 5 turns from its conversation history
+    Full roster: every registered agent with role and last activity.
+    Use before delegating to see who's available, or when the user asks
+    "what agents do you have?".
 
-    Use when the user asks:
-      • "what is task #N doing?"
-      • "why is task #N stuck?"
-      • "show me the last steps of #N"
-
-    For the *conversation* the mission is part of, use EXECUTE_REPL to
-    query inbox.db directly.
+    Every agent shares the same tool set, so the roster does not list
+    individual tools — the count is the same across the board.
     """
-    if _task_manager is None:
-        return "TaskManager not wired."
-    task = _task_manager.get_task(str(task_id))
-    if not task:
-        return f"Task #{task_id} not found."
+    registry = _agent_registry()
+    if not registry:
+        return "(no agents registered)"
 
-    # Pull live health entry
-    health = None
-    for h in _task_manager.health_snapshot():
-        if str(h["id"]) == str(task_id):
-            health = h
-            break
+    shared_tools = _tool_count()
 
-    parts = [f"═══ TASK #{task_id} ═══"]
-    parts.append(f"  status:       {task.status}")
-    parts.append(f"  complete:     {task.is_complete}")
-    parts.append(f"  mission:      {task.mission[:200]}")
+    lines = ["═══ AGENT ROSTER ═══"]
+    lines.append(f"Shared toolset: {shared_tools} tools available to every agent")
+    for name, cfg in sorted(registry.items()):
+        role = cfg.get("role", "?")
+        tag = " (CEO)" if cfg.get("is_ceo") else ""
+        last, secs = _last_activity(name)
+        active = " *active*" if (secs is not None and secs < 60) else ""
 
-    if health:
-        parts.append(f"  thread_id:    {health['thread_id']}")
-        parts.append(f"  current step: {health['step']}")
-        parts.append(
-            f"  last beat:    {health['seconds_since_heartbeat']}s ago"
-            + ("  ⚠️ STUCK" if health["is_stuck"] else "")
-        )
-        parts.append(f"  runtime:      {health['runtime_sec']}s")
+        lines.append("")
+        lines.append(f"  {name}{tag}")
+        lines.append(f"    role:  {role}")
+        lines.append(f"    last:  {last}{active}")
 
-    history = getattr(task, "conversation_history", [])
-    if history:
-        parts.append("\n  Recent turns (last 5):")
-        for entry in history[-5:]:
-            step = entry.get("step", "?")
-            result = str(entry.get("result", ""))[:140].replace("\n", " ")
-            parts.append(f"    [{step}] {result}")
-
-    return "\n".join(parts)
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# TOOL 3 — Cancel a live mission (mutates in-memory state)
+# TOOL 3 — explicit reasoning step
 # ══════════════════════════════════════════════════════════════════════
-
-@tool("Cancel Task")
-def cancel_task(task_id: str, reason: str = "") -> str:
+@tool("Think")
+def think(thought: str) -> str:
     """
-    Force-terminate a running mission. Sets its status to INTERRUPTED,
-    marks it complete, and unregisters it from the health monitor.
+    Record an explicit reasoning step. The thought lands in your tool
+    log so it's auditable — no other side effects.
 
-    Use when:
-      • the user explicitly says "stop that task" / "kill #N"
-      • Diagnose has identified a stuck task and the user authorises it
+    Use for multi-step decisions: lay out the plan before acting. For
+    example, before a complex delegation:
 
-    This mutates a *live Python object* — a plain SQL UPDATE would not
-    stop the loop. That's why this tool exists.
+        think("User wants X. This needs a worker because Y. I'll send
+               a message to Python Dev with instructions to build Z and
+               verify with `python z.py`.")
+
+    Then act. The reasoning and the action both end up in the log, in
+    order, so a later audit can see what you were thinking.
     """
-    if _task_manager is None:
-        return "TaskManager not wired."
-    task = _task_manager.get_task(str(task_id))
-    if not task:
-        return f"Task #{task_id} not found."
+    if not thought or not thought.strip():
+        return "think: nothing to record."
+
+    # Find which agent is calling (set by agent_loop via empire_tools).
+    agent_name = None
     try:
-        task.status = "INTERRUPTED"
-        task.is_complete = True
-        task.save_history_to_disk()
-        _task_manager.unregister_task(str(task_id))
-        return (
-            f"✅ Task #{task_id} cancelled."
-            + (f"  Reason: {reason}" if reason else "")
-        )
-    except Exception as e:
-        return f"Cancel failed: {e}"
+        import empire_tools
+        agent_name = empire_tools.get_log_context()
+    except Exception:
+        pass
+
+    if not agent_name:
+        return "think: no active agent context; reasoning not recorded."
+
+    try:
+        path = os.path.join(_logs_dir(agent_name), "tools.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        one_line = thought.replace("\n", " ").strip()[:400]
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{ts}  think       {one_line}\n")
+    except Exception:
+        pass
+
+    return f"Reasoning recorded ({len(thought)} chars)."
 
 
 # ══════════════════════════════════════════════════════════════════════
 # Public API
 # ══════════════════════════════════════════════════════════════════════
+# Note: `read_inbox` is NOT exported from here. The tools/inbox_tools.py
+# module owns that name — it's the CEO's tool for reading user-facing
+# inbox threads. Two modules exporting the same name would collide in
+# the EmpireTools registry.
 __all__ = [
     "system_status",
-    "inspect_task",
-    "cancel_task",
+    "list_agents",
+    "think",
     "set_observability_context",
 ]

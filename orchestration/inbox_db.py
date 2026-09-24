@@ -183,3 +183,11 @@ class InboxDB:
 
     def close(self):
         self.conn.close()
+
+    def get_messages_since(self, thread_id: str, after_id: int = 0) -> List[Dict[str, Any]]:
+        """Return all messages in `thread_id` with id > after_id, oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM inbox WHERE thread_id = ? AND id > ? ORDER BY id ASC",
+            (thread_id, after_id),
+        ).fetchall()
+        return [dict(r) for r in rows]

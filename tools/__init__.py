@@ -1,7 +1,17 @@
 # tools/__init__.py
-# tools/__init__.py
+#
+# Central exports for the tools package. Any module that does
+# `from tools import X` gets these names.
+#
+# Note on name uniqueness:
+#   Every name exported here becomes a potential EmpireTools method.
+#   Duplicate names would silently clobber each other in the registry,
+#   so each tool has exactly one home.
+#
+#   • Inbox read/write → tools/inbox_tools.py
+#   • System awareness → tools/system_observability_tools.py
+#   • Secrets, scheduler, REPL → their own modules
 
-# tools/__init__.py
 from .inbox_tools import (
     read_inbox,
     get_new_inbox_messages,
@@ -9,7 +19,9 @@ from .inbox_tools import (
     ask_user,
     set_inbox_db,
 )
+
 from .repl_tool import execute_repl
+
 from .secret_tools import (
     set_secret,
     get_secret,
@@ -17,6 +29,7 @@ from .secret_tools import (
     delete_secret,
     set_secrets_manager,
 )
+
 from .scheduler_tools import (
     add_project,
     list_projects,
@@ -26,13 +39,16 @@ from .scheduler_tools import (
     cancel_task,
     set_scheduler_db,
 )
+
 from .list_tools import list_empire_tools
+
 from .system_observability_tools import (
     system_status,
-    inspect_task,
-    cancel_task,
+    list_agents,
+    think,
     set_observability_context,
 )
+
 
 __all__ = [
     # Inbox
@@ -57,11 +73,11 @@ __all__ = [
     "complete_task",
     "cancel_task",
     "set_scheduler_db",
-    # Misc
+    # Tool discovery
     "list_empire_tools",
-    # System observability
+    # System awareness
     "system_status",
-    "inspect_task",
-    "cancel_task",
+    "list_agents",
+    "think",
     "set_observability_context",
 ]

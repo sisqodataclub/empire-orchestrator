@@ -15,11 +15,29 @@
 #       - Delegated task (is_delegated_task=True) → write back to the CEO
 #         via AgentBus.agent_reply_to_ceo(). The current mission exits.
 #
+#   • In assistant mode, SEND_REPLY ends the mission — a reply to the user
+#     is the completion of the mission. No further turns.
+#
 #   • A duplicate-reply guard prevents the same body from being queued twice
-#     on the same thread, which was a symptom of the earlier loop bugs.
+#     on the same thread.
 #
 #   • Every exit path that truly ends the mission calls self.mark_finished()
 #     so TaskManager's health watchdog stops tracking the task.
+#
+# Tool-first enforcement for actionable requests
+# ----------------------------------------------
+# The CEO sometimes calls SEND_REPLY on turn 1 with a fabricated answer —
+# no tool call, no evidence. This mixin enforces:
+#
+#   _is_actionable_request()    → regex over the user's raw message
+#   _required_tool_for()        → which tools would satisfy the request
+#   _gate_actionable_reply()    → reject SEND_REPLY / FINISH if the right
+#                                 tool hasn't been called
+#   _send_honest_failure()      → after 3 rejections, tell the user honestly
+#
+# EXECUTE_REPL and TERMINAL still set _has_tool_executed (for the citation
+# ledger), but they do NOT count as satisfying the request — only
+# CALL_TOOL of the specific required tool does.
 #
 
 import os
@@ -31,6 +49,21 @@ import uuid
 from .helpers_mixin import HelpersMixin
 from worker_dispatcher import check_async_workers
 from ..role_tools import TOOL_REGISTRY
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Actionable-request classifier.
+# ─────────────────────────────────────────────────────────────────────────────
+_ACTIONABLE_RE = re.compile(
+    r"\b("
+    r"list|show|find|read|open|check|get|fetch|search|lookup|"
+    r"create|make|build|write|delete|remove|send|update|push|pull|"
+    r"connect|connected|disconnect|deploy|run|execute|"
+    r"repositories?|repos?|issues?|pull\s*requests?|prs?|files?|"
+    r"what\s+is|what\s+are|how\s+many|how\s+much"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 class ActionHandlersMixin:
@@ -54,11 +87,161 @@ class ActionHandlersMixin:
             )
             sched.mark_task_completed(self.scheduled_task_id)
 
+    # ------------------------------------------------------------------
+    # Tool-first enforcement helpers
+    # ------------------------------------------------------------------
+    def _is_actionable_request(self) -> bool:
+        """True if the user's raw message asks for something a tool must fetch."""
+        msg = (getattr(self, 'user_message', '') or '').strip()
+        if not msg:
+            return False
+        return bool(_ACTIONABLE_RE.search(msg))
+
+    def _required_tool_for(self) -> set:
+        """
+        Return the set of CALL_TOOL names that would satisfy the current
+        user request. Empty set means "no specific tool required".
+        """
+        msg = (getattr(self, 'user_message', '') or '').lower()
+        if not msg:
+            return set()
+
+        # GitHub / repos / PRs / issues / branches / commits
+        if any(w in msg for w in (
+            "github", "repositor", " repo", "repos ", "pull request",
+            "issues", "commit", "branch", "sisqodataclub",
+        )):
+            return {
+                "search_repositories", "get_file_contents", "list_commits",
+                "list_issues", "list_pull_requests", "get_issue",
+                "get_pull_request", "search_code", "search_issues",
+                "search_users",
+            }
+
+        # Local filesystem / code
+        if any(w in msg for w in (
+            "file", "folder", "directory", "code", "source",
+        )):
+            return {
+                "list_directory", "manage_file", "inspect_code",
+                "ast_inspector", "file_manager",
+            }
+
+        # Web search
+        if any(w in msg for w in (
+            "search the web", "search web", "google", "look up", "lookup",
+        )):
+            return {"internet_search", "search_web", "scrape_webpage"}
+
+        # System health
+        if any(w in msg for w in (
+            "status", "stuck", "health", "what's happening", "whats happening",
+        )):
+            return {"system_status", "inspect_task", "system_terminal"}
+
+        # Tool discovery
+        if any(w in msg for w in ("what tools", "list tools", "describe tool")):
+            return {"list_empire_tools", "describe_tool"}
+
+        # Actionable but no specific tool recognized → any CALL_TOOL counts.
+        return {"__any_call_tool__"}
+
+    def _gate_actionable_reply(self, message_id, turn: int):
+        """
+        Decide whether a SEND_REPLY or FINISH should be allowed.
+
+        Returns (blocked, gave_up):
+          • (True,  False) — reply rejected, loop should continue
+          • (False, True)  — after 3 strikes, honest failure was sent
+          • (False, False) — reply may proceed normally
+        """
+        # Synthetic replies (emergency / fallback) are always allowed.
+        if turn is not None and turn >= 9999:
+            return (False, False)
+
+        # Delegated tasks route through AgentBus, not to the user.
+        if getattr(self, 'is_delegated_task', False):
+            return (False, False)
+
+        # Not actionable → conversational reply is fine.
+        if not self._is_actionable_request():
+            return (False, False)
+
+        # Which tools would satisfy this request?
+        required = self._required_tool_for()
+        executed = getattr(self, '_tools_executed', set()) or set()
+
+        # Was the RIGHT tool called?
+        if "__any_call_tool__" in required:
+            satisfied = bool(executed)
+        else:
+            satisfied = bool(required & executed)
+
+        if satisfied:
+            return (False, False)
+
+        # ── Block ──
+        rejections = getattr(self, '_actionable_rejections', 0) + 1
+        self._actionable_rejections = rejections
+
+        if rejections >= 3:
+            self._send_honest_failure(message_id)
+            return (False, True)
+
+        required_display = ", ".join(sorted(
+            n for n in required if not n.startswith("__")
+        )) or "(any CALL_TOOL)"
+
+        return (
+            self._block_ceo(
+                f"🚫 BLOCKED: The user asked an actionable question "
+                f"('{(getattr(self, 'user_message', '') or '')[:80]}') but "
+                f"you have NOT called the right tool. You must CALL_TOOL one "
+                f"of: {required_display}. EXECUTE_REPL and TERMINAL do NOT "
+                f"count as answering. (Attempt {rejections}/3)"
+            ),
+            False,
+        )
+
+    def _send_honest_failure(self, message_id) -> None:
+        """
+        After three rejections, tell the user honestly that the mission
+        failed, rather than fabricating a reply.
+        """
+        body = (
+            "I wasn't able to complete this request. I attempted to reply "
+            "without actually fetching the data first, which my system "
+            "rejected three times. Please try again with a fresh message "
+            "and I'll call the appropriate tool."
+        )
+
+        if getattr(self, 'inbox_db', None) and getattr(self, 'inbox_thread_id', None):
+            try:
+                self.inbox_db.add_message(
+                    thread_id=self.inbox_thread_id,
+                    direction="OUT",
+                    body=body,
+                    sender="CEO",
+                    recipient="user",
+                    status="PENDING_DELIVERY",
+                )
+            except Exception as e:
+                self.logs.append(
+                    f"[red]Failed to send honest failure to user: {e}[/red]"
+                )
+
+        self._reply_sent = True
+        self.result = body
+        self.status = "COMPLETED"
+        self.is_complete = True
+        self.save_history_to_disk()
+        try:
+            self.mark_finished()
+        except Exception:
+            pass
+
     def _extract_commitments_and_schedule(self, reply_text: str) -> None:
-        """
-        Detect promises/commitments in the CEO's reply and schedule them.
-        DISABLED by default — kept for optional use.
-        """
+        """Detect promises in the CEO's reply and schedule them. Optional."""
         if not reply_text.strip():
             return
 
@@ -113,6 +296,51 @@ Return ONLY valid JSON:
             )
 
     # ------------------------------------------------------------------
+    # Reconnaissance blocker for assistant mode
+    # ------------------------------------------------------------------
+    def _block_reconnaissance(self, action_type: str, turn: int) -> bool:
+        """
+        For assistant missions on turn > 1, block EXECUTE_REPL / TERMINAL if
+        the request needs a specific tool. Turn 1 is allowed for orientation.
+
+        Returns True if the action was blocked.
+        """
+        if action_type not in ("EXECUTE_REPL", "TERMINAL"):
+            return False
+        if self._mission_kind() != "assistant":
+            return False
+        if turn <= 1:
+            return False
+        if not self._is_actionable_request():
+            return False
+
+        required = self._required_tool_for()
+        # Only block if there's a specific tool to call.
+        if not required or "__any_call_tool__" in required:
+            return False
+
+        required_display = ", ".join(sorted(required))
+
+        self.ceo_scratchpad.blockers.append(
+            f"🚫 RECONNAISSANCE BLOCKED (turn {turn}): the user's request "
+            f"needs one of {required_display}. You had turn 1 to explore. "
+            f"Call the tool with CALL_TOOL, not EXECUTE_REPL/TERMINAL."
+        )
+        self.conversation_history.append({
+            "step": f"{turn} (RECON-BLOCKED)",
+            "agent": "🔧 System Enforcement",
+            "instruction_text": action_type,
+            "result": (
+                f"Reconnaissance blocked. Required tool(s): {required_display}."
+            ),
+            "raw_tool_outputs": [],
+            "structured_results": [],
+        })
+        self._index_turn(self.conversation_history[-1])
+        self.save_history_to_disk()
+        return True
+
+    # ------------------------------------------------------------------
     # Main dispatcher
     # ------------------------------------------------------------------
     def _execute_action(self, action_type: str, payload: dict, turn: int) -> bool:
@@ -121,6 +349,10 @@ Return ONLY valid JSON:
         Returns True if the loop should continue, False if it should stop
         (mission complete, awaiting user, or delegated task finished).
         """
+
+        # ── RECONNAISSANCE BLOCKER (assistant mode, turn > 1) ──
+        if self._block_reconnaissance(action_type, turn):
+            return True
 
         # ── WRITE_FILE — blocked, must delegate ──
         if action_type == "WRITE_FILE":
@@ -177,7 +409,14 @@ Return ONLY valid JSON:
                     self.evidence_ledger = {}
                 self.evidence_ledger[evidence_id] = str(result)
 
+                # Mark tool execution for the gate.
                 self._has_tool_executed = True
+                # Record the specific tool name — this is what actually
+                # satisfies the "required tool" check.
+                if not hasattr(self, '_tools_executed'):
+                    self._tools_executed = set()
+                self._tools_executed.add(tool_name.lower().replace(' ', '_'))
+
                 if not hasattr(self, 'valid_citations'):
                     self.valid_citations = set()
                 self.valid_citations.add(evidence_id)
@@ -216,6 +455,8 @@ Return ONLY valid JSON:
                 self.evidence_ledger = {}
             self.evidence_ledger[evidence_id] = output
 
+            # Sets the ledger flag but NOT _tools_executed — REPL doesn't
+            # count as answering a specific request.
             self._has_tool_executed = True
             if not hasattr(self, 'valid_citations'):
                 self.valid_citations = set()
@@ -245,7 +486,6 @@ Return ONLY valid JSON:
             if not cmds:
                 return True
 
-            # Delegated workers are the ones allowed to run compilers/installers.
             is_delegated = getattr(self, 'is_delegated_task', False)
 
             if not is_delegated:
@@ -299,6 +539,8 @@ Return ONLY valid JSON:
             self.compute_budget -= 0.50 * len(cmds)
             self._idle_turns = 0
             self._consecutive_blocks = 0
+            # Ledger flag, but NOT _tools_executed.
+            self._has_tool_executed = True
             self.conversation_history.append({
                 "step": f"{turn} (TERMINAL)",
                 "agent": "👑 CEO",
@@ -471,7 +713,6 @@ Return ONLY valid JSON:
 
         # ── DELEGATE (fire-and-forget via AgentBus) ──
         if action_type == "DELEGATE":
-            # No recursive delegation from a delegated worker.
             if getattr(self, 'is_delegated_task', False):
                 self.logs.append(
                     "[bold yellow]🛑 DELEGATE blocked inside a delegated task[/bold yellow]"
@@ -488,7 +729,6 @@ Return ONLY valid JSON:
                 )
                 return True
 
-            # Filter assigned_tools against registries, guarantee file_manager.
             valid_tools = set(TOOL_REGISTRY.keys())
             try:
                 import gm
@@ -499,7 +739,6 @@ Return ONLY valid JSON:
             if "file_manager" not in safe_tools:
                 safe_tools.append("file_manager")
 
-            # Determine the parent thread and message id for the reply route.
             parent_thread = getattr(self, 'inbox_thread_id', None) or "console"
             m = re.search(r'message #(\d+)', self.mission)
             parent_msg_id = int(m.group(1)) if m else None
@@ -529,12 +768,10 @@ Return ONLY valid JSON:
                 self.logs.append(
                     "[dim]Falling back to in-mission worker dispatch…[/dim]"
                 )
-                # Fallback: legacy in-mission dispatch (blocking behaviour).
                 subordinates = [a for a in self.agents if a.role != "The Global CEO"]
                 self._dispatch_worker(role, instruction, turn, subordinates)
                 return True
 
-            # Fire-and-forget: exit THIS mission. The agent runs independently.
             self.result = f"Delegated to {role}: {instruction[:150]}"
             self.status = "COMPLETED"
             self.is_complete = True
@@ -617,10 +854,16 @@ Return ONLY valid JSON:
             self._consecutive_duplicate_blocks = 0
             report = payload.get("report", "")
 
+            # Tool-first gate applies to FINISH too.
+            _blocked, _gave_up = self._gate_actionable_reply(None, turn)
+            if _blocked:
+                return True
+            if _gave_up:
+                return False
+
             # Ensure a reply was sent before finishing.
             if getattr(self, 'inbox_thread_id', None) and not getattr(self, '_reply_sent', False):
                 if getattr(self, 'is_delegated_task', False):
-                    # Route to AgentBus via SEND_REPLY.
                     self._execute_action(
                         "SEND_REPLY",
                         {"body": report or "Task completed."},
@@ -725,7 +968,6 @@ Return ONLY valid JSON:
                     self.save_history_to_disk()
                     return True
 
-            # Preserve the reply as the final result if it exists.
             if getattr(self, '_reply_sent', False):
                 final_result = self.result
             else:
@@ -819,7 +1061,6 @@ Return ONLY valid JSON:
                     self.status = "COMPLETED"
                     self.is_complete = True
                     self.save_history_to_disk()
-
                     self.mark_finished()
                     return False
                 except Exception as e:
@@ -830,6 +1071,14 @@ Return ONLY valid JSON:
 
             # ── USER-FACING reply ──
             message_id = payload.get("message_id")
+
+            # Tool-first gate for SEND_REPLY.
+            _blocked, _gave_up = self._gate_actionable_reply(message_id, turn)
+            if _blocked:
+                return True
+            if _gave_up:
+                return False
+
             request_type = getattr(self, '_last_request_type', "conversational")
 
             # Hard gate: factual/coding replies require citations.
@@ -851,7 +1100,7 @@ Return ONLY valid JSON:
                 )
                 return True
 
-            # ── Deduplicate: never send the same body twice on the same thread ──
+            # Deduplicate
             if getattr(self, 'inbox_db', None) and getattr(self, 'inbox_thread_id', None):
                 try:
                     recent = self.inbox_db.get_thread_history(
@@ -878,7 +1127,6 @@ Return ONLY valid JSON:
                 except Exception:
                     pass
 
-            # Queue the OUT message for delivery.
             if (
                 getattr(self, 'inbox_thread_id', None)
                 and getattr(self, 'inbox_db', None)
@@ -899,7 +1147,23 @@ Return ONLY valid JSON:
             self._reply_sent = True
             self.result = body
             self.save_history_to_disk()
-            # Continue the loop; mission ends with FINISH (or the fallback).
+
+            # ── In assistant mode, a reply = mission complete. ──
+            # The user's message has been answered. Don't rely on the LLM
+            # to call FINISH — end the loop here so we don't burn the turn
+            # ceiling re-sending the same reply.
+            if self._mission_kind() == "assistant":
+                self.status = "COMPLETED"
+                self.is_complete = True
+                try:
+                    self.mark_finished()
+                except Exception:
+                    pass
+                return False
+
+            # Scheduled / standalone / delegated missions keep the old
+            # behaviour — the loop continues until FINISH does its
+            # plan-gate bookkeeping.
             return True
 
         # ── ASK_USER ──

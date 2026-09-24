@@ -23,6 +23,21 @@
 #   • Calls self.mark_finished() on every exit path so TaskManager stops
 #     tracking the task.
 #
+# Recent changes (assistant-mode fix):
+#   1. mission_kind / delegated_role / parent_thread are now passed through
+#      to build_ceo_prompt. Previously they were omitted, so every prompt
+#      rendered as STANDALONE MODE — the CEO never saw the assistant-mode
+#      instructions ("ANSWER, DON'T DESCRIBE", MCP is auto-connected, etc.).
+#   2. _ensure_final_reply() no longer calls the LLM to fabricate a reply
+#      when the loop exits without one. It sends an honest failure instead.
+#      The old fallback prompt ("Reply to the user now. Return ONLY the reply
+#      text.") had no tools and no action schema, so the LLM honestly
+#      reported "I have no tools" — which looked authoritative but was
+#      meaningless.
+#   3. _emergency_reply() bypasses the tool-first gate (turn=9999) so the
+#      user still receives a graceful message if the budget runs out before
+#      any tool call.
+#
 
 import time
 import os
@@ -372,6 +387,15 @@ class CoreLoopMixin:
                 pass
 
             # ── Build prompt ──
+            # ────────────────────────────────────────────────────────────
+            # FIX: pass mission_kind, delegated_role, parent_thread.
+            # Without these, build_ceo_prompt defaulted to kind="standalone"
+            # for every mission — including Telegram threads. The CEO never
+            # saw the assistant-mode block ("ANSWER, DON'T DESCRIBE", MCP is
+            # auto-connected, etc.) and treated every user message as a
+            # headless CLI task.
+            # ────────────────────────────────────────────────────────────
+
             prompt = build_ceo_prompt(
                 mission=self.mission,
                 turn=turn,
@@ -405,7 +429,28 @@ class CoreLoopMixin:
                 allowed_actions=allowed_actions,
                 inbox_history=getattr(self, 'inbox_history_text', ""),
                 recent_task_results=recent_task_results,
+                # ── Mission kind + delegation context ──
+
+                mission_kind=mission_kind,
+                delegated_role=getattr(self, 'delegated_role', None),
+                parent_thread=getattr(self, 'parent_thread_id', None),
+                # ── Assistant-flow params ──
+                thread_id=getattr(self, 'inbox_thread_id', '') or "",
+                user_message=getattr(self, 'user_message', '') or "",
+                active_worker_report=getattr(self, '_active_worker_report', '') or "",
+                delegated_files=getattr(self, '_delegated_files', None),
             )
+
+
+
+
+
+
+
+
+
+
+
 
             # ── HEARTBEAT: before the LLM call ──
             self._beat(f"turn {turn}: calling LLM")
@@ -540,10 +585,74 @@ class CoreLoopMixin:
 
         if getattr(self, 'is_delegated_task', False):
             # Let SEND_REPLY route back to the CEO via AgentBus.
+            # turn=9999 bypasses the tool-first gate.
             self._execute_action(
                 "SEND_REPLY",
                 {"body": "Compute budget exhausted before completion."},
-                turn,
+                turn=9999,
+            )
+            return
+
+        msg_id_match = re.search(r'message #(\d+)', self.mission)
+        message_id = int(msg_id_match.group(1)) if msg_id_match else None
+        if message_id is None:
+            return
+
+        # turn=9999 bypasses the tool-first gate: emergency messages must
+        # reach the user even if no tool has been executed.
+        self._execute_action(
+            "SEND_REPLY",
+            {
+                "message_id": message_id,
+                "body": (
+                    "I'm sorry, but I've run out of compute budget for this task. "
+                    "Please try again later."
+                ),
+                "citations": [],
+            },
+            turn=9999,
+        )
+
+    # ------------------------------------------------------------------
+    # Final-reply fallback — HONEST, no fabrication
+    # ------------------------------------------------------------------
+    # The previous version of this method called the LLM with a prompt of
+    # the form:
+    #
+    #   "You are the CEO … The user sent this message: …
+    #    Reply to the user now. Return ONLY the reply text as a plain string."
+    #
+    # That prompt contains no tools and no action schema, so the LLM
+    # correctly reported "I have no tools / I have no SEND_REPLY function"
+    # — which then went out to the user as an authoritative-looking reply.
+    # It was pure fabrication, produced by a summariser that had no access
+    # to the actual mission state.
+    #
+    # The replacement below never calls the LLM. It sends a short, honest
+    # failure that tells the user the system did not complete the request.
+    # Combined with the tool-first gate in action_handlers_mixin, this path
+    # should now be unreachable for normal assistant missions.
+    # ------------------------------------------------------------------
+    def _ensure_final_reply(self, turn: int) -> None:
+        """
+        If the loop exited without a reply, send an honest failure.
+        Do NOT call the LLM again with no tools — that fabricates a reply.
+        """
+        if not getattr(self, 'inbox_thread_id', None):
+            return
+        if getattr(self, '_reply_sent', False):
+            return
+
+        self.logs.append(
+            "[yellow]⚠️ Loop exited without a reply. Sending honest failure "
+            "(no fabrication).[/yellow]"
+        )
+
+        if getattr(self, 'is_delegated_task', False):
+            self._execute_action(
+                "SEND_REPLY",
+                {"body": "Task ended before producing a verified result."},
+                turn=9999,
             )
             return
 
@@ -557,71 +666,10 @@ class CoreLoopMixin:
             {
                 "message_id": message_id,
                 "body": (
-                    "I'm sorry, but I've run out of compute budget for this task. "
-                    "Please try again later."
+                    "I wasn't able to complete this request — my mission ended "
+                    "before I produced a verified result. Please try again, or "
+                    "rephrase the request."
                 ),
-                "citations": [],
-            },
-            turn,
-        )
-
-    def _ensure_final_reply(self, turn: int) -> None:
-        """
-        If the loop exited without a reply on an inbox or delegated mission,
-        force one so the user (or CEO) is never left hanging.
-        """
-        if not getattr(self, 'inbox_thread_id', None):
-            return
-        if getattr(self, '_reply_sent', False):
-            return
-
-        self.logs.append(
-            "[yellow]⚠️ Loop exited without a reply. Forcing a final reply...[/yellow]"
-        )
-
-        if getattr(self, 'is_delegated_task', False):
-            self._execute_action(
-                "SEND_REPLY",
-                {"body": "Task ended before a reply could be produced."},
-                turn=9999,
-            )
-            return
-
-        msg_id_match = re.search(r'message #(\d+)', self.mission)
-        message_id = int(msg_id_match.group(1)) if msg_id_match else None
-        if message_id is None:
-            return
-
-        # Ask the LLM to produce one final, coherent reply.
-        fallback_prompt = f"""
-You are the CEO of an autonomous system. The user sent this message:
-
-"{self.mission}"
-
-Conversation history:
-{self.conversation_history[-5:] if self.conversation_history else "No history"}
-
-Reply to the user now. Write a concise, helpful response. If you performed
-any actions (tool calls, delegations) include the key information. If you
-failed, apologise and explain why.
-
-Return ONLY the reply text as a plain string.
-"""
-        try:
-            fallback_reply = self.director_llm.call(
-                messages=[{"role": "user", "content": fallback_prompt}]
-            ).strip()
-        except Exception as e:
-            fallback_reply = (
-                "I apologise, but I encountered an error while processing "
-                f"your request: {str(e)[:100]}"
-            )
-
-        self._execute_action(
-            "SEND_REPLY",
-            {
-                "message_id": message_id,
-                "body": fallback_reply,
                 "citations": [],
             },
             turn=9999,

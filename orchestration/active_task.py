@@ -16,8 +16,7 @@
 # Observability:
 #   • Registers itself with TaskManager on init so the health watchdog can
 #     track its heartbeat.
-#   • Unregisters on completion (handled by core_loop when FINISH is called
-#     — see below for the helper this class exposes).
+#   • Unregisters on completion.
 #
 # Recent changes:
 #   1. [DELEGATED_TASK] detection — extracts ParentThread, AgentThread, etc.
@@ -25,8 +24,10 @@
 #   3. _save_task_result() adapted for delegated tasks.
 #   4. Library query EAGER-LOAD removed — the SentenceTransformer is now
 #      loaded lazily only when the CEO actually uses the search_library tool.
-#      This eliminates a 90-second download on every mission init.
 #   5. Registers with TaskManager for heartbeat tracking.
+#   6. Tool-first enforcement state: _tools_executed, _actionable_rejections.
+#   7. Verification-wake state: _active_worker_report, _delegated_files —
+#      populated from the inbox when the mission is a worker-finished wake.
 #
 
 import os
@@ -201,6 +202,21 @@ class ActiveTask(
         self._reply_sent = False
         self._has_tool_executed = False
 
+        # ── NEW: tool-first enforcement state ──
+        # _tools_executed records the *specific* CALL_TOOL names that have
+        # run. Unlike _has_tool_executed (which also flips for EXECUTE_REPL
+        # and TERMINAL), this set is what the actionable-request gate checks.
+        # Reconnaissance does NOT count as answering the user.
+        self._tools_executed: set = set()
+        self._actionable_rejections: int = 0
+
+        # ── NEW: verification-wake state ──
+        # Populated below (after _attach_inbox) when this mission is a
+        # worker-finished wake from AgentBus. The assistant prompt uses
+        # these to render the VERIFICATION MODE block.
+        self._active_worker_report: str = ""
+        self._delegated_files: list = []
+
         # ── Scheduler DB (for task result persistence) ──
         self.scheduler_db = None
         try:
@@ -211,16 +227,42 @@ class ActiveTask(
         except Exception as e:
             logger.warning(f"Failed to initialise scheduler_db: {e}")
 
-        # ── Library recall is deferred to the CEO's 'search_library' tool ──
-        # Eagerly querying here forced a 90 MB SentenceTransformer download
-        # on every mission init, blocking the CEO loop for ~30 seconds.
-        # The model is now loaded lazily on first tool use.
-
         # ── Inbox integration (thread + trimmed history) ──
         self.inbox_db = None
         self.inbox_thread_id = None
         self.inbox_history_text = ""
         self._attach_inbox()
+
+        # ── NEW: detect worker-finished wake and load the worker's report ──
+        # When AgentBus wakes the CEO with a delegated worker's result, the
+        # mission text starts with "A worker you delegated to has finished."
+        # We pull the [AGENT_REPLY] message out of the parent thread so the
+        # assistant prompt can render VERIFICATION MODE.
+        if "worker you delegated" in (mission or "").lower():
+            try:
+                if self.inbox_db and self.inbox_thread_id:
+                    history = self.inbox_db.get_thread_history(
+                        self.inbox_thread_id, limit=5
+                    )
+                    for msg in reversed(history or []):
+                        body = (msg.get("body") or "")
+                        if msg.get("direction") == "IN" and "AGENT_REPLY" in body:
+                            self._active_worker_report = body
+                            try:
+                                import json as _json
+                                self._delegated_files = _json.loads(
+                                    msg.get("attachments") or "[]"
+                                )
+                            except Exception:
+                                self._delegated_files = []
+                            logger.info(
+                                f"Verification wake: loaded worker report "
+                                f"({len(body)} chars, "
+                                f"{len(self._delegated_files)} files)"
+                            )
+                            break
+            except Exception as e:
+                logger.warning(f"Failed to load worker report: {e}")
 
         # ── Secrets manager ──
         import base64

@@ -62,92 +62,12 @@ def pure_duckduckgo_scrape(query: str):
     return results[:5]
 
 
-#def log_agent_action(tool_name: str, action_details: str):
-#    """Logs every tool call to the imperial audit log."""   
-#    os.makedirs("agent_workspace", exist_ok=True)
-#    with open("agent_workspace/imperial_audit.log", "a", encoding="utf-8") as f:
-#        ts = datetime.now().strftime("%H:%M:%S")
-#        f.write(f"[{ts}] 🛠️ {tool_name}:\n{action_details}\n{'-'*40}\n")
-
-
-
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 0.1  LOG CONTEXT — which agent is calling, for per-agent log routing
-# ══════════════════════════════════════════════════════════════════════
-# agent_loop sets this at the start of each turn. Tool functions run on
-# the same thread (the agent's dispatcher thread), so log_agent_action
-# can read it without any call-site changes.
-
-_log_ctx = threading.local()
-
-
-def set_log_context(agent_name: str) -> None:
-    """Set the calling agent for tool-log routing. Called by agent_loop."""
-    _log_ctx.agent_name = agent_name
-
-
-def get_log_context() -> Optional[str]:
-    return getattr(_log_ctx, "agent_name", None)
-
-
-def clear_log_context() -> None:
-    """Optional: clear the context at the end of a turn."""
-    if hasattr(_log_ctx, "agent_name"):
-        del _log_ctx.agent_name
-
-
-def log_agent_action(tool_name: str, action_details: str) -> None:
-    """
-    Log a tool call.
-
-    When an agent context is set (via set_log_context, called by
-    agent_loop at the start of every turn), the line goes into that
-    agent's per-agent log at:
-        <agents_dir>/<agent_name>/logs/tools.log
-    which the CEO reads via read_agent_log.
-
-    When no context is set (legacy callers, background jobs), the line
-    falls back to the global audit log:
-        agent_workspace/imperial_audit.log
-    """
-    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    agent_name = get_log_context()
-
-    if agent_name:
-        # Per-agent log — same format as agent_loop.log_tool_event.
-        try:
-            # Lazy import avoids any load-order issue with orchestration.
-            from orchestration import agents as _agents
-            log_dir = _agents.logs_dir(agent_name)
-            os.makedirs(log_dir, exist_ok=True)
-            path = os.path.join(log_dir, "tools.log")
-            detail_one_line = action_details.replace("\n", " ").strip()[:200]
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(f"{ts}  detail      {tool_name}: {detail_one_line}\n")
-        except Exception:
-            # Never let logging break a tool call.
-            pass
-        return
-
-    # Legacy fallback: global audit log.
-    try:
-        os.makedirs("agent_workspace", exist_ok=True)
-        with open("agent_workspace/imperial_audit.log", "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] 🛠️ {tool_name}:\n{action_details}\n{'-'*40}\n")
-    except Exception:
-        pass
-
-
-
-
-
-
-
-
-
-
+def log_agent_action(tool_name: str, action_details: str):
+    """Logs every tool call to the imperial audit log."""
+    os.makedirs("agent_workspace", exist_ok=True)
+    with open("agent_workspace/imperial_audit.log", "a", encoding="utf-8") as f:
+        ts = datetime.now().strftime("%H:%M:%S")
+        f.write(f"[{ts}] 🛠️ {tool_name}:\n{action_details}\n{'-'*40}\n")
 
 
 # ==============================================================================
@@ -1899,83 +1819,6 @@ class EmpireTools:
 
 
 
-##################################################################################
-    # ──────────────────────────────────────────────────────────────────────────
-    # 🔎 DESCRIBE TOOL — read the docs for any tool by name
-    # ──────────────────────────────────────────────────────────────────────────
-    @tool("Describe Tool")
-    def describe_tool(tool_name: str):
-        """
-        Returns the full documentation for any tool in the empire — description,
-        argument signature, and an example call if the docstring has one.
-
-        Use this when list_empire_tools() shows a tool name you don't recognize.
-        Read the docs before calling the tool so you use its arguments correctly.
-
-        Args:
-          tool_name: The exact name shown by list_empire_tools (e.g.
-                     "search_repositories", "add_task", "harvest_jobs").
-        """
-        import inspect as _inspect
-
-        log_agent_action("Describe Tool", tool_name)
-
-        key = (tool_name or "").strip().lower().replace(" ", "_")
-        if not key:
-            return "❌ describe_tool requires a tool name. Call list_empire_tools first."
-
-        # Lazy imports — empire_tools is imported by gm.py, so importing gm at
-        # module scope would be circular.
-        tool = None
-        try:
-            import gm
-            tool = gm.TOOL_REGISTRY.get(key)
-        except Exception:
-            pass
-
-        # Fallback: if we happen to have a registry-like object attached to
-        # this class, check it. (Not required; gm.TOOL_REGISTRY is authoritative.)
-        if tool is None:
-            try:
-                from tools.list_tools import list_empire_tools as _let  # noqa: F401
-                # We can't query the registry from list_empire_tools directly —
-                # it's just a formatter — so we stop here and rely on the name.
-                return (
-                    f"❌ No tool named '{tool_name}'.\n"
-                    f"Call list_empire_tools to see every available tool name."
-                )
-            except Exception:
-                return f"❌ Could not resolve tool '{tool_name}'."
-
-        name = getattr(tool, "name", key)
-        desc = (getattr(tool, "description", "") or "(no description)").strip()
-
-        # Try to extract the signature from the underlying callable.
-        # crewai @tool wraps the function; the original lives on .func or .run.
-        sig = ""
-        fn = getattr(tool, "func", None) or getattr(tool, "run", None) or tool
-        try:
-            sig = str(_inspect.signature(fn))
-        except (TypeError, ValueError):
-            sig = "(signature unavailable)"
-
-        # If the docstring has an EXAMPLES section, keep it — it's the best
-        # usage hint we can give the model.
-        examples = ""
-        if "EXAMPLES:" in desc:
-            examples = "\n" + desc[desc.index("EXAMPLES:"):]
-
-        return (
-            f"Tool: {name}\n"
-            f"Key:  {key}\n"
-            f"Signature: {key}{sig}\n"
-            f"\n{desc}"
-        )
-
-
-
-
-
 
 
 
@@ -2081,21 +1924,12 @@ EmpireTools.list_empire_tools = staticmethod(list_empire_tools)
 # Everything else (inbox, scheduler, logs) is queried by the CEO directly
 # via EXECUTE_REPL / EXECUTE_TERMINAL.
 # ==============================================================================
-# ==============================================================================
-# SYSTEM OBSERVABILITY TOOLS — runtime awareness for the CEO.
-#
-# Tools: system_status, list_agents, think.
-#
-# Note: read_inbox is NOT here. That name belongs to tools/inbox_tools.py,
-# which is already attached to EmpireTools above. Re-importing it here would
-# clobber the correct binding.
-# ==============================================================================
 from tools.system_observability_tools import (
     system_status,
-    list_agents,
-    think,
+    inspect_task,
+    cancel_task,
 )
 
 EmpireTools.system_status = staticmethod(system_status)
-EmpireTools.list_agents   = staticmethod(list_agents)
-EmpireTools.think         = staticmethod(think)
+EmpireTools.inspect_task  = staticmethod(inspect_task)
+EmpireTools.cancel_task   = staticmethod(cancel_task)
