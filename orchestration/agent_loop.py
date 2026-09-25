@@ -30,6 +30,13 @@ Thinking box:
         ("YOUR RECENT REPLIES") — covering both user and worker threads,
         so it does not contradict itself across turns.
 
+Delegation dedup:
+    Before the CEO's send_message to a worker goes through, the
+    delegation body is compared against the CEO's last few delegations
+    to that same worker. If it's a near-duplicate, the send is blocked
+    and the CEO gets a system note. This stops the re-delegation loop
+    that a prompt rule alone cannot reliably stop.
+
 Reply contract:
     Every CEO SEND_REPLY to a user carries a machine-readable claim
     (claimed_actions + evidence_ids) validated against a turn ledger.
@@ -67,6 +74,15 @@ TOOL_HISTORY_LINES = 12
 REASONING_MAX_CHARS = 2500
 REPLIES_HISTORY_LIMIT = 6
 REPLIES_BODY_CHARS = 240
+
+# How similar two delegations must be (word overlap ratio) to count
+# as a duplicate. 0.75 = very similar. Lower to 0.65 if the CEO keeps
+# sneaking through with minor rephrasings.
+DELEGATION_DUPLICATE_THRESHOLD = 0.75
+
+# How many recent delegations to the same worker to check against.
+DELEGATION_LOOKBACK = 3
+
 _llm = None
 
 
@@ -197,6 +213,20 @@ def recent_replies(
             body = body[: REPLIES_BODY_CHARS - 3] + "..."
         out.append(f"  [{ts}] {body}")
     return "\n".join(out)
+
+
+# ── Delegation dedup helper ──────────────────────────────────────────
+def _similar_text(a: str, b: str, threshold: float = 0.75) -> bool:
+    """
+    Cheap word-overlap check. True if two message bodies are
+    substantially the same. Used to block duplicate delegations.
+    """
+    a_words = set(re.findall(r"\b\w{4,}\b", (a or "").lower()))
+    b_words = set(re.findall(r"\b\w{4,}\b", (b or "").lower()))
+    if not a_words or not b_words:
+        return False
+    overlap = len(a_words & b_words) / max(len(a_words | b_words), 1)
+    return overlap >= threshold
 
 
 # ── Grace turn — final honest reply before giving up ─────────────────
@@ -390,6 +420,69 @@ def run_agent_turn(agent_name: str, msg: dict) -> None:
             if not tool_name:
                 tail += "\n\nCALL_TOOL requires `tool_name`."
                 continue
+
+            # ── DELEGATION DEDUP ─────────────────────────────────────
+            # Block near-duplicate delegations to the same worker before
+            # they go out. The prompt rule tells the LLM not to do this;
+            # this code makes it physically impossible.
+            _deleg_blocked = False
+            if tool_name == "send_message":
+                to_raw   = str((tool_args or {}).get("to", "") or "")
+                new_body = str((tool_args or {}).get("body", "") or "")
+
+                if to_raw and new_body:
+                    try:
+                        target_thread = messenger._resolve_target(to_raw)
+                    except Exception:
+                        target_thread = to_raw
+
+                    if target_thread.startswith("worker_"):
+                        try:
+                            worker_thread = inbox.recent(target_thread, limit=30) or []
+                        except Exception:
+                            worker_thread = []
+                        my_prior = [
+                            m for m in worker_thread
+                            if m.get("sender") == agent_name
+                        ][-DELEGATION_LOOKBACK:]
+
+                        for prev in my_prior:
+                            if _similar_text(
+                                prev.get("body") or "",
+                                new_body,
+                                threshold=DELEGATION_DUPLICATE_THRESHOLD,
+                            ):
+                                logger.warning(
+                                    f"[{agent_name}] delegation suppressed — "
+                                    f"near-duplicate of msg #{prev.get('id')} "
+                                    f"to {target_thread}"
+                                )
+                                log_tool_event(
+                                    agent_name, "delegate_suppressed",
+                                    f"dup of #{prev.get('id')} to={target_thread}"
+                                )
+                                tail += (
+                                    f"\n\n[SYSTEM] DUPLICATE DELEGATION BLOCKED.\n"
+                                    f"You already sent a near-identical task to "
+                                    f"{target_thread} (msg #{prev.get('id')}). "
+                                    f"The worker has it.\n\n"
+                                    f"Do NOT re-delegate the same task. Instead:\n"
+                                    f"  • If the worker has reported back, "
+                                    f"SEND_REPLY to the user confirming what "
+                                    f"was done.\n"
+                                    f"  • If the worker hasn't reported yet, "
+                                    f"SEND_REPLY to the user saying it's in "
+                                    f"progress.\n"
+                                    f"  • If this is genuinely new work, "
+                                    f"rephrase the body so it isn't a "
+                                    f"duplicate of msg #{prev.get('id')}."
+                                )
+                                _deleg_blocked = True
+                                break
+
+            if _deleg_blocked:
+                continue
+            # ── END DELEGATION DEDUP ─────────────────────────────────
 
             result = _run_tool(agent_name, tool_name, tool_args)
             result_str = str(result)
