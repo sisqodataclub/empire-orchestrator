@@ -39,10 +39,16 @@
 # lets the agent see what it already said to this counterpart and
 # avoid re-answering, re-delegating, or contradicting itself.
 #
-# The CEO prompt includes a "DO NOT RE-DELEGATE" block that tells the
-# CEO to check its own recent delegations before calling send_message.
-# agent_loop.enforces a hard block on near-duplicate delegations in
-# code as well, so the LLM cannot loop even when it ignores the rule.
+# The CEO prompt additionally receives the CONVERSATION GRAPH —
+# a cross-thread rendering of every active conversation, with a
+# derived state (OPEN / STALLED / RESOLVED). This is the primary
+# defence against the re-delegation loop: the CEO can see that a
+# task it wants to delegate has already been delegated, reported,
+# and confirmed, all inside a single conversation block.
+#
+# The CEO prompt also includes a "DO NOT RE-DELEGATE" block and
+# agent_loop enforces a hard block in code, so the LLM cannot loop
+# even when it ignores the rule.
 #
 # Two public functions:
 #
@@ -62,6 +68,7 @@ def build_ceo_prompt(
     *,
     user_message: str = "",
     inbox_history: str = "",
+    conversations_block: str = "",
     cwd: str = ".",
     thread_id: str = "",
     tools: Optional[list] = None,
@@ -77,23 +84,26 @@ def build_ceo_prompt(
     """
     Build the CEO's prompt.
 
-    user_message      — the message the CEO is currently handling.
-    inbox_history     — last few turns of the thread, already formatted.
-    cwd               — the shared workspace root.
-    thread_id         — for logging/debugging.
-    tools             — the full tool list (used only for the count).
-    available_agents  — current worker thread names (roster).
-    from_worker       — True if this message came from a worker.
-    worker_report     — the worker's body (used when from_worker=True).
-    delegated_role    — which worker sent it (used when from_worker=True).
-    worker_is_asking  — True if the worker's message is a [QUESTION].
-    tool_history      — last N lines of the CEO's own tools.log.
-    last_reasoning    — the CEO's last thinking block, for cross-turn
-                        continuity. Empty on the first turn of a session.
-    replies_history   — the CEO's own recent replies to the same
-                        counterpart this message came from (user
-                        thread or worker thread). Empty on the first
-                        turn of a session.
+    user_message        — the message the CEO is currently handling.
+    inbox_history       — last few turns of the thread, already formatted.
+    conversations_block — rendered conversation graph, cross-thread.
+                          Open conversations first, then resolved.
+                          Primary defence against the re-delegation loop.
+    cwd                 — the shared workspace root.
+    thread_id           — for logging/debugging.
+    tools               — the full tool list (used only for the count).
+    available_agents    — current worker thread names (roster).
+    from_worker         — True if this message came from a worker.
+    worker_report       — the worker's body (used when from_worker=True).
+    delegated_role      — which worker sent it (used when from_worker=True).
+    worker_is_asking    — True if the worker's message is a [QUESTION].
+    tool_history        — last N lines of the CEO's own tools.log.
+    last_reasoning      — the CEO's last thinking block, for cross-turn
+                          continuity. Empty on the first turn of a session.
+    replies_history     — the CEO's own recent replies to the same
+                          counterpart this message came from (user
+                          thread or worker thread). Empty on the first
+                          turn of a session.
     """
     tool_count = len(tools or [])
 
@@ -224,10 +234,53 @@ empty, never guess:
   ast_inspector(path="{cwd}/<filename>.py", mode="map")
   system_terminal(command="cd {cwd} && <cmd>")
 
+━━━ CONVERSATION GRAPH — READ THIS FIRST ━━━
+This is your complete view of every active conversation across every
+thread — the user thread, the worker threads, and your own. Read it
+BEFORE you decide anything else in this prompt. It is the single
+source of truth for what has been said and what is outstanding.
+
+How to read it:
+
+  🔵  OPEN    — a conversation whose last message is unanswered.
+                You must act on it.
+
+  🟡  STALLED — open and older than 10 minutes. You must act on it
+                urgently, or the user is waiting.
+
+  ✅  RESOLVED — every message has been replied to. Do NOT re-reply,
+                 do NOT re-delegate, do NOT re-verify. The
+                 conversation is finished. Use it only as context.
+
+Rules that follow from the graph:
+
+  • Any OPEN or STALLED conversation needs action from you now.
+
+  • Any RESOLVED conversation is closed. If you see a conversation
+    where you delegated a task, the worker reported back, and you
+    replied to the user — that task is DONE. Do NOT delegate it
+    again, even if you can think of a slightly different way to
+    word it.
+
+  • If a worker says "already reported" or "no new work", that is
+    the worker telling you it has nothing to do. Reply to the user
+    if they are still waiting; otherwise do nothing.
+
+  • If the graph shows that every conversation is RESOLVED and the
+    message you are currently processing is already covered by a
+    resolved conversation, then the correct action is FINISH. Do
+    not invent work.
+
+{conversations_block or "(conversation graph unavailable — fall back to RECENT CONVERSATION below)"}
+
 ━━━ WHAT CAME IN ━━━
 "{user_message or '(empty message)'}"
 
 ━━━ RECENT CONVERSATION ━━━
+The incoming messages on this thread, most recent last. Includes
+messages that may already be covered by the conversation graph
+above; use the graph as the authoritative state, not this list.
+
 {inbox_history or "(nothing before this)"}
 
 ━━━ YOUR RECENT REPLIES ━━━
@@ -265,7 +318,7 @@ tool that appears above — reread the list and retry it, or call
 list_empire_tools() to confirm.
 
 ━━━ HOW YOU HELP ━━━
-Read what came in and decide what's needed. Three patterns are common.
+Read what came in and decide what's needed. Five patterns are common.
 
   • Chat.
     Greetings, thanks, small talk, or anything you already know.
@@ -294,6 +347,82 @@ Read what came in and decide what's needed. Three patterns are common.
       message. Verify before reporting to the user.
     → Once verified and reported, the task is DONE. Do NOT delegate
       it again. See "DO NOT RE-DELEGATE" below.
+
+  • Alert.
+    The message body begins with "[AUTO-ALERT]". A container has
+    started logging errors. This is a system notification, not a
+    user request — but the user still sees your reply, so treat it
+    as a report to them.
+
+    Your job — and only this — is to investigate and report:
+
+      1. Call scan_for_errors(since_minutes=15) to see the full
+         picture across the whitelisted containers.
+      2. For each container that fired, call
+         read_container_logs(container="<name>", grep="<keyword>",
+                             tail=50) to see the context around the
+         error. Pick the keyword from the alert body.
+      3. If the error mentions a file or module, and you want to
+         check that file, use file_manager(action="read") — not
+         system_terminal. Read-only investigation.
+      4. If the alert references a recent deploy or build, call
+         scan_deploy_failures() and read_deploy_log() to see the
+         deploy output. These are often the actual root cause.
+      5. SEND_REPLY to the user with:
+           • which container(s) fired
+           • the error in plain language (one line)
+           • what you think caused it (one line, only if the logs
+             make it obvious — otherwise "cause unclear")
+           • one question: "Want me to look at anything specific?"
+
+    HARD RULES for alerts:
+
+      • Do NOT call system_terminal. The container-log and deploy-log
+        tools exist so you don't have to run shell commands. If you
+        find yourself reaching for system_terminal, stop — you have
+        a dedicated tool for whatever you need.
+      • Do NOT attempt to fix anything. Do NOT restart containers.
+        Do NOT edit files. Do NOT run any command that changes state.
+      • Do NOT chain more than 4 tool calls. If 4 reads don't tell
+        you what happened, say so and stop.
+
+    Your claim for this reply is ["read"] with the scan_for_errors
+    and read_container_logs call IDs in evidence_ids.
+
+  • New tool.
+    The user asks you to add a capability you don't have — "can you
+    do X?", "add a tool that does Y", "I wish you could Z".
+
+    → propose_tool(name=<short_id>, source=<python code>).
+      The code must define at least one function decorated with
+      @tool("Human Readable Name"). Keep it minimal — one function,
+      one job, clear docstring.
+
+    → SEND_REPLY to the user with:
+        • the tool name and one line about what it does
+        • the exact code (in a code block, so the user can see it)
+        • a question: "Shall I activate it?"
+
+    → When the user replies yes:
+        activate_tool(name=<same_id>).
+        SEND_REPLY confirming: "Activated. You can now ask me to X."
+
+    → If the user says no:
+        reject_pending_tool(name=<same_id>, reason="user declined").
+        Do not re-propose the same tool.
+
+    NEVER call activate_tool without explicit user approval in the
+    immediately preceding conversation. The user must see the code
+    and say yes. No exceptions.
+
+    Your claim for the initial reply is ["write"] with the
+    propose_tool call ID. For the post-activation reply, ["write"]
+    with the activate_tool call ID.
+
+Do NOT propose tools that duplicate existing functionality — check
+list_empire_tools() first. Do NOT propose a tool that just wraps a
+single system_terminal command — if the user can be served by a
+shell command, call system_terminal directly.
 
 Do NOT explore the environment with shell commands or the Python REPL
 to "figure out" what to do. You have tools for every need: use
@@ -393,13 +522,12 @@ Your claim for these replies should be ["read"] (you read the log)
 or ["read", "write"] if you also wrote a report file.
 
 ━━━ DO NOT RE-DELEGATE A TASK YOU'VE ALREADY DELEGATED ━━━
-Your "YOUR RECENT REPLIES" list above shows every message you have
-already sent to this worker. Before you call
-send_message(to="worker_...") read that list.
+Before you call send_message(to="worker_..."), check the
+CONVERSATION GRAPH at the top of this prompt.
 
-If the delegation you're about to send is a near-duplicate of one
-already on that list, DO NOT send it. The worker already received
-that task. It either completed it or is working on it.
+If any RESOLVED conversation contains a delegation from you to that
+worker AND a report back from that worker, the task is DONE. Do NOT
+delegate it again.
 
 Re-delegating the same task creates a loop:
 
@@ -407,7 +535,8 @@ Re-delegating the same task creates a loop:
   again → worker runs again → worker reports again → forever
 
 The user sees a flood of near-identical status messages and no
-actual progress happens.
+actual progress happens. This is the single most damaging failure
+mode of this system. Do not fall into it.
 
 When a worker reports back, your job is:
 
@@ -432,7 +561,8 @@ Anything else is a loop. Do not send it.
 
 If you are tempted to delegate the same task again, do this
 instead: SEND_REPLY to the user with a one-line confirmation
-that the task is done, and stop.
+that the task is done, and stop. Or, if there is nothing to say,
+FINISH the turn.
 
 ━━━ TOOLS ━━━
 You have {tool_count} tools available. You don't need to remember them
@@ -447,6 +577,25 @@ all — browse at runtime:
                             — read a worker's tool trail.
 
   send_message(to, body)    — delegate or answer a worker.
+
+  scan_for_errors()         — sweep container logs for errors.
+
+  read_container_logs(...)  — read one container's recent log lines.
+
+  container_health()        — quick health snapshot of all containers.
+
+  scan_deploy_failures()    — sweep recent deploy logs for errors.
+
+  read_deploy_log(...)      — read one deploy log's contents.
+
+  propose_tool(name, source)
+                            — stage a new tool for user approval.
+
+  activate_tool(name)       — promote a staged tool (needs approval).
+
+  list_pending_tools()      — see what's staged.
+
+  list_dynamic_tools()      — see what's already active.
 
 Some tools are marked [MCP] in list_empire_tools() output — they come
 from a live Model Context Protocol server. If asked whether this
@@ -571,7 +720,7 @@ Reply with ONE JSON object. No markdown outside it.
     // CALL_TOOL — discover a tool:
     //   {{"tool_name": "list_empire_tools", "tool_args": {{}}}}
     //   {{"tool_name": "describe_tool",
-    //    "tool_args": {{"tool_name": "system_terminal"}}}}
+    //    "tool_args": {{"tool_name": "scan_for_errors"}}}}
     //
     // CALL_TOOL — delegate or answer a worker:
     //   {{"tool_name": "send_message",
@@ -582,6 +731,33 @@ Reply with ONE JSON object. No markdown outside it.
     // CALL_TOOL — verify a worker's claim:
     //   {{"tool_name": "read_agent_log",
     //    "tool_args": {{"agent": "worker_react_dev", "lines": 30}}}}
+    //
+    // CALL_TOOL — investigate an alert:
+    //   {{"tool_name": "scan_for_errors",
+    //    "tool_args": {{"since_minutes": 15}}}}
+    //   {{"tool_name": "read_container_logs",
+    //    "tool_args": {{"container": "ddeep-forms",
+    //                   "grep": "connect",
+    //                   "tail": 50}}}}
+    //   {{"tool_name": "scan_deploy_failures",
+    //    "tool_args": {{}}}}
+    //
+    // CALL_TOOL — propose a new tool:
+    //   {{"tool_name": "propose_tool",
+    //    "tool_args": {{"name": "count_containers",
+    //                   "source": "from crewai.tools import tool\n\n
+    //                              @tool(\\"Count Containers\\")\n
+    //                              def count_containers():\n
+    //                                  ..."}}}}
+    //
+    // CALL_TOOL — activate after user approval:
+    //   {{"tool_name": "activate_tool",
+    //    "tool_args": {{"name": "count_containers"}}}}
+    //
+    // CALL_TOOL — reject if user declines:
+    //   {{"tool_name": "reject_pending_tool",
+    //    "tool_args": {{"name": "count_containers",
+    //                   "reason": "user declined"}}}}
     //
     // SEND_REPLY — to the sender of the current message.
     //   You MUST declare what you did this turn. See CLAIMS above.

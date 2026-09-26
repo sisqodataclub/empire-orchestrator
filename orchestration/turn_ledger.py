@@ -63,8 +63,6 @@ _STATIC: dict[str, ActionClass] = {
     "internet_search":          ActionClass.QUERY,
     "scrape_webpage":           ActionClass.READ,      # fetches remote content
     "harvest_documentation":    ActionClass.WRITE,     # writes to ChromaDB
-    "read_gmail":               ActionClass.READ,
-    "send_gmail":               ActionClass.EXECUTE,   # external side effect
     "spawn_specialist":         ActionClass.WRITE,     # writes DNA file
     "consult_mission_history":  ActionClass.QUERY,
     "commit_to_global_library": ActionClass.WRITE,
@@ -74,6 +72,29 @@ _STATIC: dict[str, ActionClass] = {
     "consult_overlord":         ActionClass.OTHER,     # blocking human ask
     "harvest_jobs":             ActionClass.QUERY,
     "describe_tool":            ActionClass.OTHER,     # introspection only
+
+    # ── Gmail tools (from tools/gmail_tools.py) ────────────────────
+    "read_gmail":            ActionClass.READ,         # list latest messages
+    "read_email":            ActionClass.READ,         # full body of one UID
+    "search_emails":         ActionClass.QUERY,        # IMAP search
+    "send_gmail":            ActionClass.EXECUTE,      # external side effect
+    "reply_to_email":        ActionClass.EXECUTE,      # external side effect
+    "forward_email":         ActionClass.EXECUTE,      # external side effect
+    "list_gmail_folders":    ActionClass.READ,         # observes folders
+    "mark_email_read":       ActionClass.WRITE,        # mutates mailbox state
+    "mark_email_unread":     ActionClass.WRITE,
+    "move_email_to_folder":  ActionClass.WRITE,
+    "download_attachments":  ActionClass.READ,         # fetches from server
+    "delete_email":          ActionClass.WRITE,        # moves to Trash
+    "unread_count":          ActionClass.READ,         # observes count
+
+    # ── Container log tools (from tools/container_logs_tool.py) ────
+    # All four are read-only observations. The tools can see other
+    # containers' logs but cannot exec, restart, or modify anything.
+    "list_containers":       ActionClass.READ,         # enumerates names
+    "read_container_logs":   ActionClass.READ,         # fetches log lines
+    "scan_for_errors":       ActionClass.READ,         # sweeps for errors
+    "container_health":      ActionClass.READ,         # snapshot table
 
     # ── Attached staticmethod tools ────────────────────────────────
     "read_inbox":               ActionClass.READ,
@@ -95,6 +116,22 @@ _STATIC: dict[str, ActionClass] = {
     "system_status":            ActionClass.READ,
     "list_agents":              ActionClass.READ,
     "think":                    ActionClass.OTHER,     # scratch reasoning
+
+    # ── Deploy log tools (from tools/deploy_logs_tool.py) ──────────
+    "list_deploy_logs":      ActionClass.READ,
+    "read_deploy_log":       ActionClass.READ,
+    "scan_deploy_failures":  ActionClass.READ,
+
+    # ── Dynamic tool management ────────────────────────────────────
+    "propose_tool":         ActionClass.WRITE,
+    "list_pending_tools":   ActionClass.READ,
+    "read_pending_tool":    ActionClass.READ,
+    "activate_tool":        ActionClass.WRITE,
+    "deactivate_tool":      ActionClass.WRITE,
+    "list_dynamic_tools":   ActionClass.READ,
+    "reject_pending_tool":  ActionClass.WRITE,
+
+
 
     # ── Messenger ──────────────────────────────────────────────────
     # send_message handled arg-sensitively in classify().

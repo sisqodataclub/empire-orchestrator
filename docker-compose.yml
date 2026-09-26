@@ -72,9 +72,31 @@ services:
     environment:
       - WORKSPACE_ROOT=/app/data/workspaces
       - TELEGRAM_DB_PATH=/app/data/workspaces/telegram_bots.db
+
+      # ── Log watcher ────────────────────────────────────────────
+      # Background thread that scans container logs and queues
+      # [AUTO-ALERT] messages into the CEO's inbox when new error
+      # lines appear. Disabled by default; set ENABLED to "true".
+      # INTERVAL is in seconds (30 for testing, 300 for production).
+      # CONTAINERS is a comma-separated list matching `docker ps`
+      # names exactly; empty/unset means watch every container.
+      - LOG_WATCHER_ENABLED=true
+      - LOG_WATCHER_INTERVAL=25000
+      - LOG_WATCHER_CONTAINERS=ddeep-forms,backend,empire-api-new,empire-telegram-bot,nginx-proxy-manager
+
     volumes:
+      # Workspace tree: each org's workspace, secrets, chroma DB, etc.
       - ./data/workspaces:/app/data/workspaces
+      # HuggingFace model cache (SentenceTransformer, CrossEncoder)
       - ./data/hf_cache:/root/.cache/huggingface
+
+      # Read-only access to every container's json-file log on the host.
+      # Required by tools/container_logs_tool.py and
+      # orchestration/log_watcher.py. Without this, list_containers(),
+      # read_container_logs(), scan_for_errors(), container_health(),
+      # and the log watcher itself all return "no logs accessible".
+      - /var/lib/docker/containers:/host_containers:ro
+
     networks:
       - proxy_network
     depends_on:

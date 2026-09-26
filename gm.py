@@ -16,6 +16,7 @@
 #   orchestration/messenger.py    — send_message + read_agent_log
 #   orchestration/inbox.py        — thin helpers over InboxDB
 #   orchestration/inbox_db.py     — the SQLite table
+#   orchestration/dynamic_tools.py — staging/active/rejected/archived loader
 #   ceo_prompter.py               — build_ceo_prompt + build_worker_prompt
 #
 # This file only wires them together and exposes the entry points that
@@ -47,7 +48,7 @@ from rich.panel import Panel
 # ── Core imports ──────────────────────────────────────────────────────
 from empire_tools import EmpireTools
 from orchestration import agents, agent_loop, inbox, messenger
-from orchestration.dynamic_tools import load_dynamic_tools
+from orchestration import dynamic_tools as dt
 from orchestration.mcp_manager import load_mcp_tools
 from logger import setup_logging
 
@@ -118,9 +119,15 @@ def _load_empire_tools() -> list:
 
 
 def _load_dynamic() -> list:
-    d = os.path.join(CIVILIZATION_DIR, "dynamic_tools")
-    os.makedirs(d, exist_ok=True)
-    return load_dynamic_tools(d)
+    """
+    Import every agent-authored tool from
+        ai_civilization/dynamic_tools/active/
+
+    The staging/active/rejected/archived lifecycle is managed by
+    orchestration/dynamic_tools.py. This call only reads `active/`
+    and returns the tool objects for registration.
+    """
+    return dt.load_active_tools()
 
 
 _all_tools: list = []
@@ -143,6 +150,11 @@ for t in _all_tools:
         agents.TOOL_REGISTRY[key] = t
 
 logger.info(f"Loaded {len(agents.TOOL_REGISTRY)} tools into registry")
+
+# Note: agent-authored tools are not present in the count above until
+# activate_tool() registers them. After activation, the registry grows
+# in place and every subsequent turn sees the new tool. See
+# tools/dynamic_tools_tool.py for the runtime activation path.
 
 
 # ══════════════════════════════════════════════════════════════════════

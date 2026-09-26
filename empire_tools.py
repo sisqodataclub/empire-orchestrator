@@ -7,20 +7,12 @@ import subprocess
 import chromadb
 import numpy as np
 import requests
-import urllib.parse
 import time
 import asyncio
-import imaplib
-import smtplib
-import email
-from email.header import decode_header
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 from typing import Optional
 from pydantic import BaseModel, field_validator
 from crewai.tools import tool
-from crewai import LLM
 from rich import print as rprint
 from bs4 import BeautifulSoup
 
@@ -34,52 +26,12 @@ from sentence_transformers import SentenceTransformer
 # ==============================================================================
 # 0. HELPER FUNCTIONS
 # ==============================================================================
-def pure_duckduckgo_scrape(query: str):
-    """INTERNAL HELPER: Pure-Python scraper for DuckDuckGo."""
-    url = "https://html.duckduckgo.com/html/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    response = requests.post(url, headers=headers, data={"q": query}, timeout=15)
-    soup     = BeautifulSoup(response.text, "html.parser")
-    results  = []
-    for result in soup.find_all('div', class_='result'):
-        title_block   = result.find('h2', class_='result__title')
-        snippet_block = result.find('a',  class_='result__snippet')
-        if title_block and snippet_block:
-            a_tag = title_block.find('a')
-            if a_tag:
-                link = a_tag.get('href', '')
-                if link.startswith('//duckduckgo.com/l/?uddg='):
-                    link = urllib.parse.unquote(link.split('uddg=')[1].split('&')[0])
-                results.append({
-                    "Title":   a_tag.text.strip(),
-                    "Link":    link,
-                    "Snippet": snippet_block.text.strip()
-                })
-    return results[:5]
-
-
-#def log_agent_action(tool_name: str, action_details: str):
-#    """Logs every tool call to the imperial audit log."""   
-#    os.makedirs("agent_workspace", exist_ok=True)
-#    with open("agent_workspace/imperial_audit.log", "a", encoding="utf-8") as f:
-#        ts = datetime.now().strftime("%H:%M:%S")
-#        f.write(f"[{ts}] 🛠️ {tool_name}:\n{action_details}\n{'-'*40}\n")
-
-
-
+# (pure_duckduckgo_scrape moved to tools/internet_search_tool.py)
 
 
 # ══════════════════════════════════════════════════════════════════════
 # 0.1  LOG CONTEXT — which agent is calling, for per-agent log routing
 # ══════════════════════════════════════════════════════════════════════
-# agent_loop sets this at the start of each turn. Tool functions run on
-# the same thread (the agent's dispatcher thread), so log_agent_action
-# can read it without any call-site changes.
-
 _log_ctx = threading.local()
 
 
@@ -101,24 +53,13 @@ def clear_log_context() -> None:
 def log_agent_action(tool_name: str, action_details: str) -> None:
     """
     Log a tool call.
-
-    When an agent context is set (via set_log_context, called by
-    agent_loop at the start of every turn), the line goes into that
-    agent's per-agent log at:
-        <agents_dir>/<agent_name>/logs/tools.log
-    which the CEO reads via read_agent_log.
-
-    When no context is set (legacy callers, background jobs), the line
-    falls back to the global audit log:
-        agent_workspace/imperial_audit.log
+    (unchanged — see original for full docstring)
     """
     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     agent_name = get_log_context()
 
     if agent_name:
-        # Per-agent log — same format as agent_loop.log_tool_event.
         try:
-            # Lazy import avoids any load-order issue with orchestration.
             from orchestration import agents as _agents
             log_dir = _agents.logs_dir(agent_name)
             os.makedirs(log_dir, exist_ok=True)
@@ -127,11 +68,9 @@ def log_agent_action(tool_name: str, action_details: str) -> None:
             with open(path, "a", encoding="utf-8") as f:
                 f.write(f"{ts}  detail      {tool_name}: {detail_one_line}\n")
         except Exception:
-            # Never let logging break a tool call.
             pass
         return
 
-    # Legacy fallback: global audit log.
     try:
         os.makedirs("agent_workspace", exist_ok=True)
         with open("agent_workspace/imperial_audit.log", "a", encoding="utf-8") as f:
@@ -140,20 +79,8 @@ def log_agent_action(tool_name: str, action_details: str) -> None:
         pass
 
 
-
-
-
-
-
-
-
-
-
-
 # ==============================================================================
 # 0.5  SCRATCH DIR — sandboxed per-mission temp file zone
-# Created here at module level so all tools can reference it.
-# Per-mission sub-dirs (scratch/mission_1/) are created by task_manager.py.
 # ==============================================================================
 SCRATCH_DIR = os.path.abspath(os.path.join("ai_civilization", "scratch"))
 os.makedirs(SCRATCH_DIR, exist_ok=True)
@@ -173,13 +100,7 @@ def _get_embedding_model():
         _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
     return _embedding_model
 
-# ChromaDB v0.4.16+ requires parameter name 'input'
 
-# ChromaDB v0.4.16+ requires parameter name 'input'
-# ─── ChromaDB 1.x-compatible embedding function ────────────────────────────
-# ChromaDB ≥1.0 calls embed_query() during .query() and embed_documents()
-# during .add()/.upsert(). Older versions only called __call__. We implement
-# all three so this object works on both.
 class EmbeddingFunction:
     def name(self) -> str:
         return "all-MiniLM-L6-v2"
@@ -191,32 +112,22 @@ class EmbeddingFunction:
         return model.encode(input, convert_to_numpy=True).tolist()
 
     def embed_query(self, input):
-        """Required by ChromaDB 1.x for query() calls."""
         model = _get_embedding_model()
         if isinstance(input, str):
             input = [input]
         return model.encode(input, convert_to_numpy=True).tolist()
 
     def embed_documents(self, input):
-        """Required by ChromaDB 1.x for add() / upsert() calls."""
         model = _get_embedding_model()
         if isinstance(input, str):
             input = [input]
         return model.encode(input, convert_to_numpy=True).tolist()
 
-# ─── Single embedding function instance ─────────────────────────────────────
+
 ef = EmbeddingFunction()
 
 
-
-
-
-
-
-
-# ─── Helper to safely create a collection with our embedding ──────────────
 def _safe_get_or_create_collection(name: str):
-    """Try to get or create a collection with our embedding; if conflict, delete and recreate."""
     try:
         return chroma_client.get_or_create_collection(
             name=name,
@@ -232,16 +143,14 @@ def _safe_get_or_create_collection(name: str):
         else:
             raise
 
-# ─── Create / update all collections ──────────────────────────────────────
+
 library_collection = _safe_get_or_create_collection("empire_library")
 logs_collection    = _safe_get_or_create_collection("current_mission_logs")
 docs_collection    = _safe_get_or_create_collection("empire_docs")
 
 
 # ==============================================================================
-# 1.5  PYDANTIC MEMORY SCHEMAS — all ChromaDB commits are validated here first.
-#      If the LLM generates malformed JSON, validation fails silently and the
-#      bad entry is dropped (logged to failed_commits.jsonl, never crashes).
+# 1.5  PYDANTIC MEMORY SCHEMAS
 # ==============================================================================
 
 class LessonEntry(BaseModel):
@@ -263,7 +172,7 @@ class LessonEntry(BaseModel):
 
 class AgentMemoryEntry(BaseModel):
     """Schema for a personal memory entry committed to per-agent ChromaDB (Tier 1)."""
-    entry_type:  str = "fix"            # fix | pattern | warning
+    entry_type:  str = "fix"
     technology:  str
     error:       str
     fix:         str
@@ -285,7 +194,6 @@ class AgentMemoryEntry(BaseModel):
 
 
 def _log_failed_commit(raw: dict, error: str) -> None:
-    """Write malformed LLM-generated memory entries to a log instead of crashing."""
     log_path = os.path.join("ai_civilization", "failed_commits.jsonl")
     os.makedirs("ai_civilization", exist_ok=True)
     with open(log_path, "a", encoding="utf-8") as f:
@@ -297,14 +205,10 @@ def _log_failed_commit(raw: dict, error: str) -> None:
 
 
 # ==============================================================================
-# 1.6  ENV VERSION EXTRACTION — reads package.json + requirements.txt to get
-#      major version numbers for dependency-aware memory storage and recall.
-#      Stored as flat ints (e.g. env_react_major=18) because ChromaDB metadata
-#      supports numeric filtering but NOT nested dicts or semver strings.
+# 1.6  ENV VERSION EXTRACTION
 # ==============================================================================
 
 def _extract_env_versions(cwd: str) -> dict:
-    """Return {pkg_name_major: int} from package.json and requirements.txt."""
     versions: dict = {}
 
     pkg_path = os.path.join(cwd, "package.json")
@@ -338,9 +242,6 @@ def _extract_env_versions(cwd: str) -> dict:
 
 # ==============================================================================
 # 1.7  PER-AGENT PERSONAL CHROMADB HELPERS (Tier 1 memory)
-#      Each agent gets their own collection: agent_{role_slug}
-#      Written async (fire-and-forget) after verified success.
-#      Read at session start — top 3 relevant personal memories injected.
 # ==============================================================================
 
 def _agent_collection_name(role: str) -> str:
@@ -349,7 +250,6 @@ def _agent_collection_name(role: str) -> str:
 
 
 def get_agent_collection(role: str):
-    """Get or create the personal ChromaDB collection for an agent role."""
     try:
         name = _agent_collection_name(role)
         return chroma_client.get_or_create_collection(
@@ -361,11 +261,6 @@ def get_agent_collection(role: str):
 
 
 def query_agent_memory(role: str, query: str, top_k: int = 3) -> list:
-    """
-    Query an agent's personal memory collection.
-    Returns a list of dicts with {text, technology, verified_by, age_days, stale_warning}.
-    Applies staleness flagging (> 90 days + version drift).
-    """
     results = []
     try:
         col = get_agent_collection(role)
@@ -403,14 +298,12 @@ def query_agent_memory(role: str, query: str, top_k: int = 3) -> list:
                 "stale_warning": None
             }
 
-            # Staleness check: > 90 days old AND version drift detected
             date_str = meta.get('date', '')
             if date_str:
                 try:
                     entry_date = datetime.strptime(date_str[:15], "%Y%m%d_%H%M%S")
                     age_days   = (now - entry_date).days
                     if age_days > 90:
-                        # Check for version drift on relevant package
                         tech_key = re.sub(r'[^a-z0-9_]', '_', entry["technology"].lower())[:20]
                         mem_ver  = meta.get(f"env_{tech_key}_major")
                         cur_ver  = current_versions.get(f"env_{tech_key}_major")
@@ -432,11 +325,6 @@ def query_agent_memory(role: str, query: str, top_k: int = 3) -> list:
 
 
 def write_agent_memory_async(role: str, entry_dict: dict, cwd: str = "") -> None:
-    """
-    Fire-and-forget write to agent's personal ChromaDB.
-    Validates via Pydantic first. Silently drops malformed entries (logs to failed_commits.jsonl).
-    Should only be called after verified success (Mentor pass or SIMPLE tier completion).
-    """
     def _write():
         try:
             validated = AgentMemoryEntry(**entry_dict)
@@ -451,7 +339,6 @@ def write_agent_memory_async(role: str, entry_dict: dict, cwd: str = "") -> None
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             memory_id = f"mem_{hashlib.md5((role + validated.technology + validated.error).encode()).hexdigest()[:10]}"
 
-            # Deduplicate: delete existing entry with same memory_id if it exists
             try:
                 col.delete(ids=[memory_id])
             except Exception:
@@ -481,12 +368,6 @@ def write_agent_memory_async(role: str, entry_dict: dict, cwd: str = "") -> None
 
 
 def auto_commit_global_lesson(structured_result: dict, agent_role: str, cwd: str = "") -> None:
-    """
-    Auto-commit a lesson to the shared global library (Tier 2) after Mentor pass.
-    Only fires when structured_result['status'] == 'success' AND verified_by is set.
-    Validates via Pydantic. Silently drops malformed entries.
-    Called from cognitive_wrapper after successful Mentor evaluation.
-    """
     if structured_result.get("status") != "success":
         return
     if not structured_result.get("verified_by"):
@@ -516,7 +397,6 @@ def auto_commit_global_lesson(structured_result: dict, agent_role: str, cwd: str
                 concept   = f"{validated.technology}: {validated.error[:60]}"
                 lesson_id = f"lesson_{hashlib.md5(concept.encode()).hexdigest()[:10]}"
 
-                # Deduplicate
                 existing = library_collection.query(
                     query_texts=[concept], n_results=1,
                     include=["distances", "ids"]
@@ -552,8 +432,9 @@ def auto_commit_global_lesson(structured_result: dict, agent_role: str, cwd: str
             except Exception:
                 pass
 
+
 # ==============================================================================
-# 2. RERANKER MODEL — lazy-loaded on first use, not at import time
+# 2. RERANKER MODEL — lazy-loaded
 # ==============================================================================
 _reranker_model = None
 
@@ -565,18 +446,13 @@ def _get_reranker():
         _reranker_model = _CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
     return _reranker_model
 
-# Keep `reranker_model` as a property-like accessor for backward compat
+
 class _LazyReranker:
     def predict(self, pairs):
         return _get_reranker().predict(pairs)
 
 reranker_model = _LazyReranker()
 
-# ==============================================================================
-# 2. RATE LIMITER FOR SEARCH
-# ==============================================================================
-_search_lock      = threading.Lock()
-_last_search_time = 0.0
 
 # ==============================================================================
 # 3. EMPIRE TOOLS
@@ -702,480 +578,6 @@ class EmpireTools:
             return f"❌ FILE MANAGER ERROR: {str(e)}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 🔬 AST INSPECTOR — Understand files via code, not cat
-    # Replaces `cat file.py` with a structured skeleton that costs ~95% fewer tokens.
-    # Use this BEFORE File Manager read for any file > 100 lines.
-    # ──────────────────────────────────────────────────────────────────────────
-    @tool("AST Inspector")
-    def inspect_code(path: str, mode: str = "map", target: str = ""):
-        """
-        Understands source files using code analysis — NOT raw text dumping.
-        Replaces `cat file.py` for large files. Use this first, then extract only what you need.
-
-        MODES:
-          'map'     — Full structural skeleton: all classes, functions, fields, line numbers.
-                      Returns ~400 tokens instead of 8,000 for a large file. USE THIS FIRST.
-          'extract' — Pull a specific class or function by name (exact lines, no noise).
-                      Use after 'map' tells you the line range.
-          'fields'  — List all Pydantic/SQLAlchemy fields and their types for a class.
-                      Instantly answers "what columns does ProfileDB have?" in ~100 tokens.
-          'imports' — List all imports and what they bring in. Diagnoses ModuleNotFoundError fast.
-          'section' — Read lines start_line..end_line (use line numbers from 'map' output).
-                      More precise than sed -n, works for any language.
-
-        ARGS:
-          path   — Absolute path to the file.
-          mode   — One of: map | extract | fields | imports | section
-          target — For extract/fields: class or function name (e.g. "ProfileDB").
-                   For section: "start_line,end_line" (e.g. "45,80").
-
-        EXAMPLES:
-          map     : inspect_code('/app/backend/models.py', 'map')
-          extract : inspect_code('/app/backend/models.py', 'extract', 'ProfileDB')
-          fields  : inspect_code('/app/backend/models.py', 'fields',  'ProfileCreate')
-          imports : inspect_code('/app/backend/main.py',   'imports')
-          section : inspect_code('/app/backend/models.py', 'section', '45,80')
-
-        Supports: Python (.py), TypeScript (.ts, .tsx), JavaScript (.js, .jsx).
-        Falls back to section-reading for unknown file types.
-        """
-        log_agent_action("AST Inspector", f"mode={mode} target={target!r} path={path}")
-
-        if not os.path.exists(path):
-            return f"❌ FILE NOT FOUND: '{path}'. Use 'List Directory' to verify the path."
-
-        ext = os.path.splitext(path)[1].lower()
-
-        try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                source = f.read()
-                lines  = source.splitlines()
-        except Exception as e:
-            return f"❌ Could not read file: {e}"
-
-        total_lines = len(lines)
-        file_size   = len(source)
-
-        # ── SECTION MODE (language-agnostic) ───────────────────────────────────
-        if mode == "section":
-            try:
-                if ',' in str(target):
-                    start, end = [int(x.strip()) for x in str(target).split(',', 1)]
-                else:
-                    return "❌ section mode requires target='start_line,end_line' e.g. '45,80'"
-                start = max(1, start)
-                end   = min(total_lines, end)
-                chunk = '\n'.join(
-                    f"{i+1:4d} │ {line}"
-                    for i, line in enumerate(lines[start-1:end], start=start-1)
-                )
-                return (
-                    f"📄 {os.path.basename(path)}  lines {start}–{end} / {total_lines}\n"
-                    f"{'─'*50}\n{chunk}"
-                )
-            except Exception as e:
-                return f"❌ section error: {e}"
-
-        # ══════════════════════════════════════════════════════════════════════
-        # PYTHON AST ANALYSIS
-        # ══════════════════════════════════════════════════════════════════════
-        if ext == '.py':
-            import ast as _ast
-
-            try:
-                tree = _ast.parse(source)
-            except SyntaxError as se:
-                # Syntax errors are gold — report line and context
-                bad_line = lines[se.lineno - 1] if se.lineno and se.lineno <= len(lines) else "?"
-                return (
-                    f"❌ SYNTAX ERROR in {os.path.basename(path)}:\n"
-                    f"  Line {se.lineno}: {se.msg}\n"
-                    f"  Code: {bad_line.strip()}\n"
-                    f"  Fix this before doing anything else."
-                )
-
-            # ── IMPORTS ──────────────────────────────────────────────────────
-            if mode == "imports":
-                out = [f"📦 IMPORTS — {os.path.basename(path)}  ({total_lines} lines)\n{'─'*50}"]
-                for node in _ast.walk(tree):
-                    if isinstance(node, _ast.Import):
-                        for alias in node.names:
-                            label = f" as {alias.asname}" if alias.asname else ""
-                            out.append(f"  line {node.lineno:4d} │ import {alias.name}{label}")
-                    elif isinstance(node, _ast.ImportFrom):
-                        mod   = node.module or ''
-                        names = ', '.join(
-                            (a.asname or a.name) for a in node.names
-                        )
-                        out.append(f"  line {node.lineno:4d} │ from {mod} import {names}")
-                return '\n'.join(out) or "No imports found."
-
-            # ── MAP MODE — full skeleton ──────────────────────────────────────
-            if mode == "map":
-                out = [
-                    f"🗺️  STRUCTURE MAP — {os.path.basename(path)}\n"
-                    f"    {total_lines} lines | {file_size:,} chars\n"
-                    f"{'═'*54}"
-                ]
-
-                # Top-level imports (summarised)
-                imports = []
-                for node in tree.body:
-                    if isinstance(node, _ast.Import):
-                        imports += [a.name for a in node.names]
-                    elif isinstance(node, _ast.ImportFrom):
-                        imports.append(f"{node.module}.*")
-                if imports:
-                    out.append(f"  IMPORTS: {', '.join(imports[:12])}"
-                               + (" ..." if len(imports) > 12 else ""))
-
-                # Classes & functions
-                for node in tree.body:
-                    if isinstance(node, _ast.ClassDef):
-                        bases = ', '.join(
-                            getattr(b, 'id', getattr(b, 'attr', '?'))
-                            for b in node.bases
-                        )
-                        end_line = max(
-                            (getattr(n, 'lineno', node.lineno) for n in _ast.walk(node)),
-                            default=node.lineno
-                        )
-                        out.append(
-                            f"\n  CLASS {node.name}({bases})"
-                            f"  [lines {node.lineno}–{end_line}]"
-                        )
-
-                        # Class-level assignments (columns, fields)
-                        for item in node.body:
-                            if isinstance(item, _ast.Assign):
-                                for t in item.targets:
-                                    name = getattr(t, 'id', '?')
-                                    # Detect Column() / relationship() / Field() calls
-                                    val  = item.value
-                                    if isinstance(val, _ast.Call):
-                                        func = getattr(val.func, 'id',
-                                                       getattr(val.func, 'attr', '?'))
-                                        # First positional arg (type hint)
-                                        first = ''
-                                        if val.args:
-                                            first = getattr(val.args[0], 'id',
-                                                            getattr(val.args[0], 'attr', ''))
-                                        kw_str = ', '.join(
-                                            f"{kw.keyword.arg}=..."
-                                            for kw in []  # keywords exist but too verbose
-                                        )
-                                        out.append(
-                                            f"    {name} = {func}({first})"
-                                            f"  [line {item.lineno}]"
-                                        )
-                            elif isinstance(item, _ast.AnnAssign):
-                                # type-annotated fields: name: Type = ...
-                                name = getattr(item.target, 'id', '?')
-                                ann  = _ast.unparse(item.annotation) if hasattr(_ast, 'unparse') else '?'
-                                out.append(f"    {name}: {ann}  [line {item.lineno}]")
-
-                        # Methods
-                        for item in node.body:
-                            if isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
-                                args = [a.arg for a in item.args.args if a.arg != 'self']
-                                prefix = 'async ' if isinstance(item, _ast.AsyncFunctionDef) else ''
-                                out.append(
-                                    f"    {prefix}def {item.name}({', '.join(args)})"
-                                    f"  [line {item.lineno}]"
-                                )
-
-                    elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
-                        args   = [a.arg for a in node.args.args]
-                        prefix = 'async ' if isinstance(node, _ast.AsyncFunctionDef) else ''
-                        out.append(
-                            f"\n  {prefix}def {node.name}({', '.join(args)})"
-                            f"  [line {node.lineno}]"
-                        )
-
-                out.append(
-                    f"\n{'─'*54}\n"
-                    f"  ➡ Next: use mode='extract' target='ClassName' for full class source,\n"
-                    f"          or mode='fields' target='ClassName' for column/field list only,\n"
-                    f"          or mode='section' target='start,end' for raw lines."
-                )
-                return '\n'.join(out)
-
-            # ── EXTRACT — pull a named class or function ───────────────────────
-            if mode == "extract":
-                if not target:
-                    return "❌ extract mode requires target='ClassName' or target='function_name'"
-                for node in _ast.walk(tree):
-                    if (isinstance(node, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef))
-                            and node.name == target):
-                        end_line = max(
-                            (getattr(n, 'lineno', node.lineno) for n in _ast.walk(node)),
-                            default=node.lineno
-                        )
-                        chunk = '\n'.join(
-                            f"{i+1:4d} │ {line}"
-                            for i, line in enumerate(
-                                lines[node.lineno - 1:end_line], start=node.lineno - 1
-                            )
-                        )
-                        return (
-                            f"📄 {target}  lines {node.lineno}–{end_line} "
-                            f"/ {total_lines}  [{os.path.basename(path)}]\n"
-                            f"{'─'*54}\n{chunk}"
-                        )
-                return (
-                    f"❌ '{target}' not found in {os.path.basename(path)}.\n"
-                    f"Run mode='map' to see all available names."
-                )
-
-            # ── FIELDS — Pydantic / SQLAlchemy column inventory ───────────────
-            if mode == "fields":
-                if not target:
-                    return "❌ fields mode requires target='ClassName'"
-                for node in _ast.walk(tree):
-                    if isinstance(node, _ast.ClassDef) and node.name == target:
-                        out = [
-                            f"🗂️  FIELDS — {target}  [{os.path.basename(path)}]\n{'─'*50}"
-                        ]
-                        found_any = False
-                        for item in node.body:
-                            # Annotated: name: Type = Field(...)
-                            if isinstance(item, _ast.AnnAssign):
-                                name     = getattr(item.target, 'id', '?')
-                                ann      = (_ast.unparse(item.annotation)
-                                            if hasattr(_ast, 'unparse') else '?')
-                                optional = 'Optional' in ann or 'None' in ann
-                                default  = ''
-                                if item.value:
-                                    if isinstance(item.value, _ast.Constant):
-                                        default = f" = {item.value.value!r}"
-                                    elif isinstance(item.value, _ast.Call):
-                                        func = getattr(item.value.func, 'id',
-                                                       getattr(item.value.func, 'attr', ''))
-                                        default = f" = {func}(...)"
-                                flag = " [optional]" if optional else " [required]"
-                                out.append(f"  {name}: {ann}{default}{flag}  [line {item.lineno}]")
-                                found_any = True
-                            # Plain assignment: name = Column(...) / relationship(...)
-                            elif isinstance(item, _ast.Assign):
-                                for t in item.targets:
-                                    name = getattr(t, 'id', '?')
-                                    val  = item.value
-                                    if isinstance(val, _ast.Call):
-                                        func = getattr(val.func, 'id',
-                                                       getattr(val.func, 'attr', '?'))
-                                        args_strs = []
-                                        for a in val.args[:2]:
-                                            args_strs.append(
-                                                getattr(a, 'id',
-                                                getattr(a, 'attr',
-                                                str(getattr(a, 'value', '?'))))
-                                            )
-                                        kwargs = {
-                                            kw.arg: getattr(kw.value, 'value',
-                                                            getattr(kw.value, 'id', '?'))
-                                            for kw in val.keywords if kw.arg
-                                        }
-                                        nullable = kwargs.get('nullable', True)
-                                        fk       = 'foreign_key' in str(kwargs) or 'ForeignKey' in str(args_strs)
-                                        flags    = []
-                                        if nullable is False: flags.append("NOT NULL")
-                                        if fk:                flags.append("FK")
-                                        if kwargs.get('primary_key'): flags.append("PK")
-                                        flag_str = f"  [{', '.join(flags)}]" if flags else ""
-                                        out.append(
-                                            f"  {name} = {func}({', '.join(args_strs)})"
-                                            f"{flag_str}  [line {item.lineno}]"
-                                        )
-                                        found_any = True
-                        if not found_any:
-                            out.append("  (no annotated fields or Column() assignments found)")
-                        return '\n'.join(out)
-                return (
-                    f"❌ Class '{target}' not found in {os.path.basename(path)}.\n"
-                    f"Run mode='map' to see all class names."
-                )
-
-        # ══════════════════════════════════════════════════════════════════════
-        # TYPESCRIPT / JAVASCRIPT ANALYSIS (regex-based, no external deps)
-        # ══════════════════════════════════════════════════════════════════════
-        if ext in ('.ts', '.tsx', '.js', '.jsx'):
-            import re as _re
-
-            # ── IMPORTS ──────────────────────────────────────────────────────
-            if mode == "imports":
-                out  = [f"📦 IMPORTS — {os.path.basename(path)}  ({total_lines} lines)\n{'─'*50}"]
-                patt = _re.compile(
-                    r"^(?:import|export)\s.*?(?:from\s+['\"](.+?)['\"]|require\(['\"](.+?)['\"]\))",
-                    _re.MULTILINE
-                )
-                for i, line in enumerate(lines, 1):
-                    m = patt.match(line.strip())
-                    if m:
-                        out.append(f"  line {i:4d} │ {line.strip()}")
-                return '\n'.join(out)
-
-            # ── MAP MODE ─────────────────────────────────────────────────────
-            if mode == "map":
-                out = [
-                    f"🗺️  STRUCTURE MAP — {os.path.basename(path)}\n"
-                    f"    {total_lines} lines | {file_size:,} chars\n"
-                    f"{'═'*54}"
-                ]
-
-                # Patterns for TS/JS
-                iface_re   = _re.compile(r'^\s*(?:export\s+)?interface\s+(\w+)')
-                type_re    = _re.compile(r'^\s*(?:export\s+)?type\s+(\w+)\s*=')
-                class_re   = _re.compile(r'^\s*(?:export\s+)?(?:abstract\s+)?class\s+(\w+)')
-                fn_re      = _re.compile(
-                    r'^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)'
-                )
-                arrow_re   = _re.compile(
-                    r'^\s*(?:export\s+)?const\s+(\w+)\s*[=:]\s*(?:async\s*)?\('
-                )
-                field_re   = _re.compile(r'^\s+(\w+)\??:\s*(.+?)[;,]?\s*$')
-
-                current_block = None  # (name, type, start_line)
-                brace_depth   = 0
-
-                for i, line in enumerate(lines, 1):
-                    stripped = line.strip()
-
-                    m = iface_re.match(line)
-                    if m:
-                        current_block = (m.group(1), 'interface', i)
-                        brace_depth   = line.count('{') - line.count('}')
-                        out.append(f"\n  INTERFACE {m.group(1)}  [line {i}]")
-                        continue
-
-                    m = type_re.match(line)
-                    if m:
-                        out.append(f"\n  TYPE {m.group(1)}  [line {i}]")
-                        continue
-
-                    m = class_re.match(line)
-                    if m:
-                        current_block = (m.group(1), 'class', i)
-                        brace_depth   = line.count('{') - line.count('}')
-                        out.append(f"\n  CLASS {m.group(1)}  [line {i}]")
-                        continue
-
-                    m = fn_re.match(line) or arrow_re.match(line)
-                    if m and not current_block:
-                        out.append(f"  fn {m.group(1)}()  [line {i}]")
-                        continue
-
-                    if current_block:
-                        brace_depth += line.count('{') - line.count('}')
-                        # Show fields inside interfaces/classes
-                        fm = field_re.match(line)
-                        if fm and brace_depth > 0:
-                            optional = '?' in line.split(':')[0]
-                            flag     = " [optional]" if optional else " [required]"
-                            out.append(
-                                f"    {fm.group(1)}: {fm.group(2).rstrip(';, ')}{flag}"
-                                f"  [line {i}]"
-                            )
-                        if brace_depth <= 0:
-                            current_block = None
-
-                out.append(
-                    f"\n{'─'*54}\n"
-                    f"  ➡ Next: mode='extract' target='InterfaceName' for full definition,\n"
-                    f"          mode='section' target='start,end' for raw lines."
-                )
-                return '\n'.join(out)
-
-            # ── EXTRACT — pull a named interface/class/function ────────────────
-            if mode == "extract":
-                if not target:
-                    return "❌ extract mode requires target='InterfaceName'"
-                import re as _re
-                # Find the definition line
-                start_line = None
-                patt = _re.compile(
-                    rf'(?:interface|class|type|function|const)\s+{_re.escape(target)}\b'
-                )
-                for i, line in enumerate(lines, 1):
-                    if patt.search(line):
-                        start_line = i
-                        break
-                if not start_line:
-                    return (
-                        f"❌ '{target}' not found in {os.path.basename(path)}.\n"
-                        f"Run mode='map' to see all available names."
-                    )
-                # Walk forward counting braces to find the end
-                depth    = 0
-                end_line = start_line
-                started  = False
-                for i in range(start_line - 1, total_lines):
-                    depth    += lines[i].count('{') - lines[i].count('}')
-                    end_line = i + 1
-                    if depth > 0:
-                        started = True
-                    if started and depth <= 0:
-                        break
-                chunk = '\n'.join(
-                    f"{i+1:4d} │ {line}"
-                    for i, line in enumerate(lines[start_line-1:end_line], start=start_line-1)
-                )
-                return (
-                    f"📄 {target}  lines {start_line}–{end_line} "
-                    f"/ {total_lines}  [{os.path.basename(path)}]\n"
-                    f"{'─'*54}\n{chunk}"
-                )
-
-            # ── FIELDS — TypeScript interface field listing ────────────────────
-            if mode == "fields":
-                if not target:
-                    return "❌ fields mode requires target='InterfaceName'"
-                import re as _re
-                patt    = _re.compile(
-                    rf'(?:interface|type)\s+{_re.escape(target)}\b'
-                )
-                in_block = False
-                depth    = 0
-                out      = [f"🗂️  FIELDS — {target}  [{os.path.basename(path)}]\n{'─'*50}"]
-                for i, line in enumerate(lines, 1):
-                    if patt.search(line):
-                        in_block = True
-                    if in_block:
-                        depth += line.count('{') - line.count('}')
-                        fm = _re.match(r'^\s+(\w+)(\?)?\s*:\s*(.+?)[;,]?\s*$', line)
-                        if fm:
-                            name     = fm.group(1)
-                            optional = bool(fm.group(2))
-                            typ      = fm.group(3).rstrip(';, ')
-                            flag     = " [optional]" if optional else " [required]"
-                            out.append(f"  {name}: {typ}{flag}  [line {i}]")
-                        if in_block and depth <= 0 and '{' in ''.join(lines[:i]):
-                            break
-                if len(out) == 1:
-                    return (
-                        f"❌ Interface/Type '{target}' not found.\n"
-                        f"Run mode='map' to see all names."
-                    )
-                return '\n'.join(out)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # FALLBACK — unsupported file type: section read only
-        # ══════════════════════════════════════════════════════════════════════
-        if mode == "map":
-            # Generic map: just show line count + first 30 lines as preview
-            preview = '\n'.join(f"{i+1:4d} │ {l}" for i, l in enumerate(lines[:30]))
-            return (
-                f"📄 {os.path.basename(path)}  [{total_lines} lines | {file_size:,} chars]\n"
-                f"File type '{ext}' — Python/TS AST not available. Preview (first 30 lines):\n"
-                f"{'─'*50}\n{preview}\n{'─'*50}\n"
-                f"Use mode='section' target='start,end' to read specific ranges."
-            )
-
-        return (
-            f"❌ mode='{mode}' not supported for '{ext}' files.\n"
-            f"Supported modes for this type: section."
-        )
-
-    # ──────────────────────────────────────────────────────────────────────────
     # 📁 LIST DIRECTORY
     # ──────────────────────────────────────────────────────────────────────────
     @tool("List Directory")
@@ -1222,51 +624,9 @@ class EmpireTools:
             return f"❌ LIST DIRECTORY ERROR: {str(e)}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 🌐 INTERNET SEARCH (Rate-limited)
+    # 🌐 INTERNET SEARCH — moved to tools/internet_search_tool.py
+    # 🔬 AST INSPECTOR   — moved to tools/ast_inspector_tool.py
     # ──────────────────────────────────────────────────────────────────────────
-    @tool("Internet Search")
-    def search_web(raw_query: str):
-        """
-        Searches the live internet via DuckDuckGo. Rate-limited to prevent IP blocks.
-        Rewrites the query for developer context before searching.
-        """
-        global _last_search_time
-        with _search_lock:
-            elapsed = time.time() - _last_search_time
-            if elapsed < 2.0:
-                time.sleep(2.0 - elapsed)
-            _last_search_time = time.time()
-
-        log_agent_action("Internet Search", raw_query)
-        try:
-            api_key    = os.getenv("deepseek")
-            search_llm = LLM(
-                model="openai/deepseek-chat",
-                base_url="https://api.deepseek.com",
-                api_key=api_key,
-                temperature=0.1
-            )
-            clean_query = search_llm.call(
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Optimize this search query for a software developer: '{raw_query}'. "
-                        f"Respond with ONLY 3-6 words. No quotes, no explanation."
-                    )
-                }]
-            ).strip().replace('"', '')
-
-            results = pure_duckduckgo_scrape(clean_query)
-            if not results:
-                return f"❌ No results for: '{clean_query}'. Try rephrasing."
-
-            output = f"✅ SEARCH RESULTS for: '{clean_query}'\n\n"
-            for idx, res in enumerate(results, 1):
-                output += f"{idx}. **{res['Title']}**\n🔗 {res['Link']}\n📄 {res['Snippet']}\n\n"
-            return output
-
-        except Exception as e:
-            return f"❌ Search Error: {e}"
 
     # ──────────────────────────────────────────────────────────────────────────
     # 🕷️ SCRAPE WEBPAGE (With requests fallback)
@@ -1287,7 +647,6 @@ class EmpireTools:
 
         text = None
 
-        # Attempt 1: Selenium
         try:
             from selenium import webdriver
             from selenium.webdriver.chrome.options import Options
@@ -1305,7 +664,6 @@ class EmpireTools:
         except Exception as selenium_err:
             log_agent_action("Scrape Webpage", f"Selenium failed ({selenium_err}). Falling back.")
 
-        # Attempt 2: requests fallback
         if not text:
             try:
                 resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
@@ -1320,7 +678,7 @@ class EmpireTools:
         return f"✅ Saved {len(text):,} chars to '{filepath}'."
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 📥 HARVEST DOCUMENTATION — Crawl4AI → docs_collection (separate from lessons)
+    # 📥 HARVEST DOCUMENTATION
     # ──────────────────────────────────────────────────────────────────────────
     @tool("Harvest Documentation")
     def harvest_documentation(url: str, topic_name: str):
@@ -1347,7 +705,6 @@ class EmpireTools:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             doc_id    = f"doc_{hashlib.md5(url.encode()).hexdigest()[:12]}"
 
-            # Upsert: remove old version first
             try:
                 docs_collection.delete(ids=[doc_id])
             except Exception:
@@ -1370,103 +727,6 @@ class EmpireTools:
 
         except Exception as e:
             return f"❌ Harvest Error: {e}"
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 📧 READ GMAIL (Via App Password)
-    # ──────────────────────────────────────────────────────────────────────────
-    @tool("Read Gmail")
-    def read_latest_emails(search_keyword: str = "ALL", limit: int = 5):
-        """
-        Reads the latest emails from Gmail using IMAP.
-        Use search_keyword to filter (e.g., 'Indeed', 'Password', 'from:hr@company.com').
-        Requires SMTP_EMAIL and SMTP_PASSWORD in .env.
-        """
-        log_agent_action("Read Gmail", f"Keyword: {search_keyword} | Limit: {limit}")
-        SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-        SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
-        if not SMTP_EMAIL or not SMTP_PASSWORD:
-            return "❌ Missing SMTP_EMAIL or SMTP_PASSWORD in .env. Ask the Overlord to provide them."
-
-        try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(SMTP_EMAIL, SMTP_PASSWORD)
-            mail.select("inbox")
-
-            status, messages = mail.search(None, f'(TEXT "{search_keyword}")' if search_keyword != "ALL" else "ALL")
-
-            if status != "OK" or not messages[0]:
-                mail.logout()
-                return f"📭 No emails found matching '{search_keyword}'."
-
-            email_ids = messages[0].split()
-            latest_ids = email_ids[-limit:]
-
-            output = []
-            for e_id in reversed(latest_ids):
-                res, msg_data = mail.fetch(e_id, "(RFC822)")
-                for response_part in msg_data:
-                    if isinstance(response_part, tuple):
-                        msg = email.message_from_bytes(response_part[1])
-
-                        subject_header = decode_header(msg.get("Subject", "No Subject"))[0]
-                        subject, encoding = subject_header
-                        if isinstance(subject, bytes):
-                            subject = subject.decode(encoding if encoding else "utf-8", errors="replace")
-
-                        body = ""
-                        if msg.is_multipart():
-                            for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
-                                    payload = part.get_payload(decode=True)
-                                    if payload:
-                                        body = payload.decode(errors="replace")
-                                    break
-                        else:
-                            payload = msg.get_payload(decode=True)
-                            if payload:
-                                body = payload.decode(errors="replace")
-
-                        output.append(f"📩 SUBJECT: {subject}\nFROM: {msg.get('From')}\nDATE: {msg.get('Date')}\nBODY:\n{body[:1000]}\n{'-'*50}")
-
-            mail.logout()
-            return "\n".join(output)
-
-        except Exception as e:
-            return f"❌ Gmail IMAP Error: {e}"
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 📤 SEND GMAIL (Via App Password)
-    # ──────────────────────────────────────────────────────────────────────────
-    @tool("Send Gmail")
-    def send_email(to_email: str, subject: str, body: str):
-        """
-        Sends an email using Gmail SMTP.
-        Requires SMTP_EMAIL and SMTP_PASSWORD in .env.
-        """
-        log_agent_action("Send Gmail", f"To: {to_email} | Subject: {subject}")
-        SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-        SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
-        if not SMTP_EMAIL or not SMTP_PASSWORD:
-            return "❌ Missing SMTP_EMAIL or SMTP_PASSWORD in .env. Ask the Overlord to provide them."
-
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = SMTP_EMAIL
-            msg['To'] = to_email
-            msg['Subject'] = subject
-            msg.attach(MIMEText(body, 'plain'))
-
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.send_message(msg)
-            server.quit()
-
-            return f"✅ Email successfully sent to {to_email} with subject '{subject}'"
-        except Exception as e:
-            return f"❌ Gmail SMTP Error: {e}"
 
     # ──────────────────────────────────────────────────────────────────────────
     # 🧬 SPAWN SPECIALIST
@@ -1511,7 +771,7 @@ class EmpireTools:
             return f"❌ Mission Log Search Error: {e}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 💾 COMMIT TO GLOBAL LIBRARY — Pydantic-validated, version-pinned, trust-scored
+    # 💾 COMMIT TO GLOBAL LIBRARY
     # ──────────────────────────────────────────────────────────────────────────
     @tool("Commit to Global Library")
     def commit_to_library(concept: str, detail: str):
@@ -1523,8 +783,6 @@ class EmpireTools:
         """
         log_agent_action("Commit to Global Library", f"Concept: {concept}")
 
-        # Parse structured format: "technology | error | fix"
-        # Falls back to treating detail as the fix if unparseable
         parts = [p.strip() for p in detail.split('|')]
         if len(parts) >= 3:
             raw = {"technology": parts[0], "error": parts[1], "fix": '|'.join(parts[2:])}
@@ -1533,7 +791,6 @@ class EmpireTools:
         else:
             raw = {"technology": concept, "error": "general", "fix": detail}
 
-        # Pydantic validation — silently drops malformed entries
         try:
             validated = LessonEntry(**raw)
         except Exception as e:
@@ -1547,7 +804,6 @@ class EmpireTools:
             concept_key = f"{validated.technology}: {validated.error[:60]}"
             lesson_id   = f"lesson_{hashlib.md5(concept_key.encode()).hexdigest()[:10]}"
 
-            # Deduplication check
             existing = library_collection.query(
                 query_texts=[concept_key], n_results=1,
                 include=["distances", "ids"]
@@ -1572,7 +828,7 @@ class EmpireTools:
                 "date":        timestamp,
                 "trust_score": 0.7,
                 "verified_by": validated.verified_by or "",
-                **versions          # e.g. env_react_major=18, env_mui_major=7
+                **versions
             }
             library_collection.add(
                 documents=[text],
@@ -1585,7 +841,7 @@ class EmpireTools:
             return f"❌ Library Commit Error: {e}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 🔍 SEARCH EMPIRE LIBRARY — Hybrid Vector+BM25+Reranker, trust-filtered
+    # 🔍 SEARCH EMPIRE LIBRARY
     # ──────────────────────────────────────────────────────────────────────────
     @tool("Search Empire Library")
     def search_library(query: str):
@@ -1602,7 +858,6 @@ class EmpireTools:
             if not all_data['documents']:
                 return "📚 Library is empty. Use 'Commit to Global Library' to populate it."
 
-            # Filter: lessons only, trust_score >= 0.4, no MASTER_DOC or intelligence_reports
             filtered_docs, filtered_metas = [], []
             for doc, meta in zip(all_data['documents'], all_data['metadatas']):
                 if meta.get('type') in ('intelligence_report', 'MASTER_DOC', 'documentation'):
@@ -1615,27 +870,23 @@ class EmpireTools:
             if not filtered_docs:
                 return "No trusted lessons found in library yet."
 
-            # Branch 1: Vector Search
             vec_res   = library_collection.query(
                 query_texts=[query], n_results=min(10, len(filtered_docs))
             )
             vec_docs  = vec_res['documents'][0]
             vec_metas = vec_res['metadatas'][0]
-            # Re-filter vector results
             vec_pairs = [
                 (d, m) for d, m in zip(vec_docs, vec_metas)
                 if m.get('type') not in ('intelligence_report', 'MASTER_DOC', 'documentation')
                 and m.get('trust_score', 1.0) >= 0.4
             ]
 
-            # Branch 2: BM25 Keyword Search on filtered corpus
             tokenized = [doc.lower().split() for doc in filtered_docs]
             bm25      = BM25Okapi(tokenized)
             scores    = bm25.get_scores(query.lower().split())
             top_idx   = np.argsort(scores)[::-1][:10]
             bm25_pairs = [(filtered_docs[i], filtered_metas[i]) for i in top_idx]
 
-            # Merge and deduplicate
             seen, combined = set(), []
             for doc, meta in vec_pairs + bm25_pairs:
                 key = doc[:100]
@@ -1646,7 +897,6 @@ class EmpireTools:
             if not combined:
                 return "No relevant results found."
 
-            # CrossEncoder rerank
             pairs  = [[query, doc] for doc, _ in combined]
             scores = reranker_model.predict(pairs)
             ranked = sorted(
@@ -1654,7 +904,6 @@ class EmpireTools:
                 key=lambda x: x[2], reverse=True
             )
 
-            # Staleness detection
             cwd              = os.getcwd()
             current_versions = _extract_env_versions(cwd)
             now              = datetime.now()
@@ -1671,7 +920,6 @@ class EmpireTools:
                         entry_date = datetime.strptime(date[:15], "%Y%m%d_%H%M%S")
                         age_days   = (now - entry_date).days
                         if age_days > 90:
-                            # Check version drift
                             for vk, vv in current_versions.items():
                                 mem_vv = meta.get(vk)
                                 if mem_vv and mem_vv != vv:
@@ -1693,7 +941,7 @@ class EmpireTools:
             return f"❌ Hybrid Search Failed: {e}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 📚 QUERY OFFICIAL DOCS — queries docs_collection (separate from lessons)
+    # 📚 QUERY OFFICIAL DOCS
     # ──────────────────────────────────────────────────────────────────────────
     @tool("Query Official Docs")
     def query_docs(search_query: str):
@@ -1741,7 +989,7 @@ class EmpireTools:
             return f"❌ Doc Query Failed: {e}"
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 🚫 INVALIDATE MEMORY — lower trust score when a retrieved memory was wrong
+    # 🚫 INVALIDATE MEMORY
     # ──────────────────────────────────────────────────────────────────────────
     @tool("Invalidate Memory")
     def invalidate_memory(memory_id: str, reason: str = ""):
@@ -1775,7 +1023,7 @@ class EmpireTools:
         return f"⚠️ Memory ID '{memory_id}' not found in library. Check the ID from search results."
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 🆘 CONSULT OVERLORD (Non-blocking, file-based, with timeout + escalation)
+    # 🆘 CONSULT OVERLORD
     # ──────────────────────────────────────────────────────────────────────────
     @tool("Consult Overlord")
     def consult_overlord(question: str, error_details: str):
@@ -1807,7 +1055,6 @@ class EmpireTools:
                 "timestamp": datetime.now().isoformat()
             }, f, indent=4)
 
-        # Non-blocking poll with 5-minute timeout
         start_time = time.time()
         while time.time() - start_time < 300:
             time.sleep(3)
@@ -1834,7 +1081,6 @@ class EmpireTools:
     # ──────────────────────────────────────────────────────────────────────────
     # 🕵️ THE HEADHUNTER (JobSpy Integration)
     # ──────────────────────────────────────────────────────────────────────────
-
     @tool("Harvest Jobs")
     def harvest_jobs(search_term: str, location: str, limit: int = 5, sites: list = None):
         """
@@ -1858,20 +1104,18 @@ class EmpireTools:
             sites = ["indeed", "linkedin"]
 
         try:
-            # JobSpy returns a Pandas DataFrame
             jobs_df = scrape_jobs(
                 site_name=sites,
                 search_term=search_term,
                 location=location,
                 results_wanted=limit,
                 country_dict_name="UK" if "UK" in location.upper() or "UNITED KINGDOM" in location.upper() else "USA",
-                hours_old=72, # Only get fresh jobs
+                hours_old=72,
             )
 
             if jobs_df.empty:
                 return f"📭 No jobs found for '{search_term}' in '{location}'."
 
-            # Convert to a clean list of dictionaries
             jobs_data = jobs_df.to_dict(orient="records")
 
             output = []
@@ -1880,7 +1124,7 @@ class EmpireTools:
                 company = job.get('company', 'Unknown Company')
                 site = job.get('site', 'Unknown')
                 url = job.get('job_url', 'No URL')
-                desc = str(job.get('description', ''))[:500] # Truncate desc to save tokens
+                desc = str(job.get('description', ''))[:500]
 
                 output.append(
                     f"🏢 [{site.upper()}] {title} @ {company}\n"
@@ -1893,10 +1137,6 @@ class EmpireTools:
 
         except Exception as e:
             return f"❌ Job Harvest Error: {e}"
-
-
-
-
 
 
 ##################################################################################
@@ -1924,8 +1164,6 @@ class EmpireTools:
         if not key:
             return "❌ describe_tool requires a tool name. Call list_empire_tools first."
 
-        # Lazy imports — empire_tools is imported by gm.py, so importing gm at
-        # module scope would be circular.
         tool = None
         try:
             import gm
@@ -1933,13 +1171,9 @@ class EmpireTools:
         except Exception:
             pass
 
-        # Fallback: if we happen to have a registry-like object attached to
-        # this class, check it. (Not required; gm.TOOL_REGISTRY is authoritative.)
         if tool is None:
             try:
                 from tools.list_tools import list_empire_tools as _let  # noqa: F401
-                # We can't query the registry from list_empire_tools directly —
-                # it's just a formatter — so we stop here and rely on the name.
                 return (
                     f"❌ No tool named '{tool_name}'.\n"
                     f"Call list_empire_tools to see every available tool name."
@@ -1950,8 +1184,6 @@ class EmpireTools:
         name = getattr(tool, "name", key)
         desc = (getattr(tool, "description", "") or "(no description)").strip()
 
-        # Try to extract the signature from the underlying callable.
-        # crewai @tool wraps the function; the original lives on .func or .run.
         sig = ""
         fn = getattr(tool, "func", None) or getattr(tool, "run", None) or tool
         try:
@@ -1959,8 +1191,6 @@ class EmpireTools:
         except (TypeError, ValueError):
             sig = "(signature unavailable)"
 
-        # If the docstring has an EXAMPLES section, keep it — it's the best
-        # usage hint we can give the model.
         examples = ""
         if "EXAMPLES:" in desc:
             examples = "\n" + desc[desc.index("EXAMPLES:"):]
@@ -1973,29 +1203,28 @@ class EmpireTools:
         )
 
 
-
-
-
-
-
-
 # ==============================================================================
-# EXPORT MODULE‑LEVEL FUNCTION FOR AST INSPECTOR
+# BACKWARD-COMPAT ast_inspector WRAPPER
+#
+# The old version was `EmpireTools.inspect_code` plus a module-level
+# `ast_inspector(...)` wrapper. Both moved to tools/ast_inspector_tool.py.
+# This module re-exports a plain callable under the same name so any code
+# doing `from empire_tools import ast_inspector` keeps working.
+#
+# The @tool-decorated version is attached to EmpireTools below so the
+# registry loader still picks it up.
 # ==============================================================================
-_empire_tools_instance = EmpireTools()
+from tools.ast_inspector_tool import ast_inspector as _ast_inspector_tool
+EmpireTools.inspect_code = staticmethod(_ast_inspector_tool)
+
 
 def ast_inspector(path: str, mode: str = "map", target: str = ""):
-    """
-    Module‑level wrapper for EmpireTools.inspect_code.
-    Allows importing `ast_inspector` directly from empire_tools.
-    """
-    return _empire_tools_instance.inspect_code(path, mode, target)
+    """Backward-compat plain callable wrapper around the AST Inspector tool."""
+    return _ast_inspector_tool.run(path=path, mode=mode, target=target)
 
 
 # ==============================================================================
-# ==============================================================================
-# INBOX TOOLS – imported from tools/inbox_tools.py and attached to EmpireTools
-# so they are discovered by _load_empire_tools() in gm.py
+# INBOX TOOLS
 # ==============================================================================
 from tools.inbox_tools import (
     read_inbox,
@@ -2014,7 +1243,7 @@ set_inbox_db = set_inbox_db
 
 
 # ==============================================================================
-# REPL TOOL – imported from tools/repl_tool.py and attached to EmpireTools
+# REPL TOOL
 # ==============================================================================
 from tools.repl_tool import execute_repl
 
@@ -2022,7 +1251,7 @@ EmpireTools.execute_repl = staticmethod(execute_repl)
 
 
 # ==============================================================================
-# SECRET TOOLS – imported from tools/secret_tools.py and attached to EmpireTools
+# SECRET TOOLS
 # ==============================================================================
 from tools.secret_tools import (
     set_secret,
@@ -2041,8 +1270,7 @@ set_secrets_manager = set_secrets_manager
 
 
 # ==============================================================================
-# SCHEDULER TOOLS – imported from tools/scheduler_tools.py
-# (Names now match the CEO prompt: add_task / list_tasks, not "Add Scheduled Task")
+# SCHEDULER TOOLS
 # ==============================================================================
 from tools.scheduler_tools import (
     add_project,
@@ -2065,30 +1293,125 @@ set_scheduler_db = set_scheduler_db
 
 
 # ==============================================================================
-# LIST EMPIRE TOOLS – returns the catalog of all available tools
+# LIST EMPIRE TOOLS
 # ==============================================================================
 from tools.list_tools import list_empire_tools
 
 EmpireTools.list_empire_tools = staticmethod(list_empire_tools)
 
 
+# ==============================================================================
+# GMAIL TOOLS
+# ==============================================================================
+from tools.gmail_tools import (
+    read_latest_emails,
+    read_email,
+    search_emails,
+    send_email,
+    reply_to_email,
+    forward_email,
+    list_gmail_folders,
+    mark_email_read,
+    mark_email_unread,
+    move_email_to_folder,
+    download_attachments,
+    delete_email,
+    unread_count,
+)
 
+EmpireTools.read_latest_emails   = staticmethod(read_latest_emails)
+EmpireTools.read_email           = staticmethod(read_email)
+EmpireTools.search_emails        = staticmethod(search_emails)
+EmpireTools.send_email           = staticmethod(send_email)
+EmpireTools.reply_to_email       = staticmethod(reply_to_email)
+EmpireTools.forward_email        = staticmethod(forward_email)
+EmpireTools.list_gmail_folders   = staticmethod(list_gmail_folders)
+EmpireTools.mark_email_read      = staticmethod(mark_email_read)
+EmpireTools.mark_email_unread    = staticmethod(mark_email_unread)
+EmpireTools.move_email_to_folder = staticmethod(move_email_to_folder)
+EmpireTools.download_attachments = staticmethod(download_attachments)
+EmpireTools.delete_email         = staticmethod(delete_email)
+EmpireTools.unread_count         = staticmethod(unread_count)
 
 
 # ==============================================================================
-# SYSTEM OBSERVABILITY TOOLS — read / inspect live in-memory task state.
-# Only 3 tools: system_status, inspect_task, cancel_task.
-# Everything else (inbox, scheduler, logs) is queried by the CEO directly
-# via EXECUTE_REPL / EXECUTE_TERMINAL.
+# INTERNET SEARCH — moved to tools/internet_search_tool.py
 # ==============================================================================
+from tools.internet_search_tool import internet_search
+
+EmpireTools.internet_search = staticmethod(internet_search)
+
+
 # ==============================================================================
-# SYSTEM OBSERVABILITY TOOLS — runtime awareness for the CEO.
+# CONTAINER LOG TOOLS — read-only view of other containers' logs.
 #
-# Tools: system_status, list_agents, think.
+# The host's /var/lib/docker/containers directory is bind-mounted at
+# /host_containers (read-only). The tools walk it, parse Docker's json-file
+# logs, and expose:
 #
-# Note: read_inbox is NOT here. That name belongs to tools/inbox_tools.py,
-# which is already attached to EmpireTools above. Re-importing it here would
-# clobber the correct binding.
+#   list_containers      — enumerate accessible containers by name
+#   read_container_logs  — fetch recent lines for one container, filterable
+#   scan_for_errors      — sweep every container for error-looking lines
+#   container_health     — quick health table across all containers
+#
+# Deliberately read-only: no docker socket, no exec, no restart.
+# ==============================================================================
+from tools.container_logs_tool import (
+    list_containers,
+    read_container_logs,
+    scan_for_errors,
+    container_health,
+)
+
+EmpireTools.list_containers     = staticmethod(list_containers)
+EmpireTools.read_container_logs = staticmethod(read_container_logs)
+EmpireTools.scan_for_errors     = staticmethod(scan_for_errors)
+EmpireTools.container_health    = staticmethod(container_health)
+
+
+# ==============================================================================
+# DEPLOY LOG TOOLS — read-only view of deployment logs.
+# ==============================================================================
+from tools.deploy_logs_tool import (
+    list_deploy_logs,
+    read_deploy_log,
+    scan_deploy_failures,
+)
+
+EmpireTools.list_deploy_logs     = staticmethod(list_deploy_logs)
+EmpireTools.read_deploy_log      = staticmethod(read_deploy_log)
+EmpireTools.scan_deploy_failures = staticmethod(scan_deploy_failures)
+
+
+
+
+# ==============================================================================
+# DYNAMIC TOOLS — agent-authored, staged, activated at runtime.
+# ==============================================================================
+from tools.dynamic_tools_tool import (
+    propose_tool,
+    list_pending_tools,
+    read_pending_tool,
+    activate_tool,
+    deactivate_tool,
+    list_dynamic_tools,
+    reject_pending_tool,
+)
+
+EmpireTools.propose_tool        = staticmethod(propose_tool)
+EmpireTools.list_pending_tools  = staticmethod(list_pending_tools)
+EmpireTools.read_pending_tool   = staticmethod(read_pending_tool)
+EmpireTools.activate_tool       = staticmethod(activate_tool)
+EmpireTools.deactivate_tool     = staticmethod(deactivate_tool)
+EmpireTools.list_dynamic_tools  = staticmethod(list_dynamic_tools)
+EmpireTools.reject_pending_tool = staticmethod(reject_pending_tool)
+
+
+
+
+
+# ==============================================================================
+# SYSTEM OBSERVABILITY TOOLS
 # ==============================================================================
 from tools.system_observability_tools import (
     system_status,

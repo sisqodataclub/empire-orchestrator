@@ -30,12 +30,24 @@ Thinking box:
         ("YOUR RECENT REPLIES") — covering both user and worker threads,
         so it does not contradict itself across turns.
 
+Conversation graph (CEO only):
+    Every message has a parent_message_id pointing at the message it
+    responds to. That graph crosses threads — the CEO's delegation to
+    a worker has the user message as its parent, the worker's report
+    has the delegation as its parent, the CEO's reply to the user has
+    the report as its parent. build_conversations() walks the graph
+    and renders the whole arc per conversation, with a derived status
+    (open / stalled / resolved). This is what stops the CEO from
+    re-delegating a task it has already completed — the resolved
+    conversation shows the delegation, the worker's report, and the
+    CEO's confirmation all in one block.
+
 Delegation dedup:
     Before the CEO's send_message to a worker goes through, the
     delegation body is compared against the CEO's last few delegations
     to that same worker. If it's a near-duplicate, the send is blocked
-    and the CEO gets a system note. This stops the re-delegation loop
-    that a prompt rule alone cannot reliably stop.
+    and the CEO gets a system note. This is a second line of defence
+    behind the conversation graph.
 
 Reply contract:
     Every CEO SEND_REPLY to a user carries a machine-readable claim
@@ -44,6 +56,13 @@ Reply contract:
 
 Grace turn:
     One last LLM call before giving up, bypassing contract and thinking.
+
+Tool-arg aliases:
+    A tool parameter that has been renamed will still be called by its
+    old name for a while — the LLM imitates its own recent tool calls,
+    which are fed back into the prompt from tools.log. _TOOL_ARG_ALIASES
+    remaps old names to new ones before dispatch so a rename takes
+    effect immediately without waiting for history to age out.
 """
 import json
 import logging
@@ -54,7 +73,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import empire_tools
-from orchestration import agents, inbox, messenger
+from orchestration import agents, inbox, messenger, conversations
 from orchestration.turn_ledger import TurnLedger
 from orchestration.reply_contract import ClaimedAction, validate as validate_reply
 from orchestration.thinking import (
@@ -76,12 +95,21 @@ REPLIES_HISTORY_LIMIT = 6
 REPLIES_BODY_CHARS = 240
 
 # How similar two delegations must be (word overlap ratio) to count
-# as a duplicate. 0.75 = very similar. Lower to 0.65 if the CEO keeps
-# sneaking through with minor rephrasings.
-DELEGATION_DUPLICATE_THRESHOLD = 0.75
+# as a duplicate. Lower to 0.60 if the CEO keeps sneaking through
+# with minor rephrasings.
+DELEGATION_DUPLICATE_THRESHOLD = 0.65
 
 # How many recent delegations to the same worker to check against.
-DELEGATION_LOOKBACK = 3
+DELEGATION_LOOKBACK = 4
+
+# Backward-compatibility aliases for tool parameters that have been
+# renamed. The LLM imitates its own tool history from tools.log, so
+# after a rename it keeps sending the old name for a while. Remap
+# here so the rename takes effect without breaking the LLM.
+_TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "internet_search": {"raw_query": "query"},
+    # Future renames go here: "tool_key": {"old_name": "new_name"},
+}
 
 _llm = None
 
@@ -213,6 +241,23 @@ def recent_replies(
             body = body[: REPLIES_BODY_CHARS - 3] + "..."
         out.append(f"  [{ts}] {body}")
     return "\n".join(out)
+
+
+# ── Conversation graph (for CEO prompt context) ──────────────────────
+def _build_conversation_block() -> str:
+    """
+    Walk the inbox parent_message_id graph and render every active
+    conversation. Returns the rendered block, or "" on failure. Never
+    raises — a graph failure must not block the turn.
+    """
+    try:
+        convos = conversations.build_conversations()
+        if not convos:
+            return ""
+        return conversations.render(convos, viewer="ceo")
+    except Exception:
+        logger.exception("conversation graph build failed")
+        return ""
 
 
 # ── Delegation dedup helper ──────────────────────────────────────────
@@ -349,10 +394,16 @@ def run_agent_turn(agent_name: str, msg: dict) -> None:
     # thread for workers.
     replies_history = recent_replies(agent_name, msg)
 
+    # Conversation graph — CEO only. Walks the parent_message_id chain
+    # across all threads to give a single coherent view of every
+    # active conversation, with derived status. Empty for workers.
+    conversations_block = _build_conversation_block() if cfg["is_ceo"] else ""
+
     if cfg["is_ceo"]:
         prompt = ceo_prompter.build_ceo_prompt(
             user_message=body,
             inbox_history=history,
+            conversations_block=conversations_block,
             cwd=agents.WORKSPACE_DIR,
             thread_id=agent_name,
             tools=agent_tools,
@@ -422,9 +473,11 @@ def run_agent_turn(agent_name: str, msg: dict) -> None:
                 continue
 
             # ── DELEGATION DEDUP ─────────────────────────────────────
-            # Block near-duplicate delegations to the same worker before
-            # they go out. The prompt rule tells the LLM not to do this;
-            # this code makes it physically impossible.
+            # Block near-duplicate delegations to the same worker
+            # before they go out. Two checks:
+            #   A. Worker's most recent messages say "already reported"
+            #      / "no new work" → block outright.
+            #   B. Near-duplicate of a recent delegation body → block.
             _deleg_blocked = False
             if tool_name == "send_message":
                 to_raw   = str((tool_args or {}).get("to", "") or "")
@@ -441,44 +494,83 @@ def run_agent_turn(agent_name: str, msg: dict) -> None:
                             worker_thread = inbox.recent(target_thread, limit=30) or []
                         except Exception:
                             worker_thread = []
-                        my_prior = [
-                            m for m in worker_thread
-                            if m.get("sender") == agent_name
-                        ][-DELEGATION_LOOKBACK:]
 
-                        for prev in my_prior:
-                            if _similar_text(
-                                prev.get("body") or "",
-                                new_body,
-                                threshold=DELEGATION_DUPLICATE_THRESHOLD,
-                            ):
+                        # Check A — worker says done.
+                        worker_recent = [
+                            m for m in worker_thread
+                            if m.get("sender") == target_thread
+                        ][-2:]
+                        for wm in worker_recent:
+                            wbody = (wm.get("body") or "").lower()
+                            if ("already reported" in wbody
+                                    or "no new work" in wbody
+                                    or "already done" in wbody):
                                 logger.warning(
                                     f"[{agent_name}] delegation suppressed — "
-                                    f"near-duplicate of msg #{prev.get('id')} "
-                                    f"to {target_thread}"
+                                    f"{target_thread} already reported done"
                                 )
                                 log_tool_event(
                                     agent_name, "delegate_suppressed",
-                                    f"dup of #{prev.get('id')} to={target_thread}"
+                                    f"worker_says_done to={target_thread}"
                                 )
                                 tail += (
-                                    f"\n\n[SYSTEM] DUPLICATE DELEGATION BLOCKED.\n"
-                                    f"You already sent a near-identical task to "
-                                    f"{target_thread} (msg #{prev.get('id')}). "
-                                    f"The worker has it.\n\n"
-                                    f"Do NOT re-delegate the same task. Instead:\n"
-                                    f"  • If the worker has reported back, "
-                                    f"SEND_REPLY to the user confirming what "
-                                    f"was done.\n"
-                                    f"  • If the worker hasn't reported yet, "
-                                    f"SEND_REPLY to the user saying it's in "
-                                    f"progress.\n"
-                                    f"  • If this is genuinely new work, "
-                                    f"rephrase the body so it isn't a "
-                                    f"duplicate of msg #{prev.get('id')}."
+                                    f"\n\n[SYSTEM] DELEGATION BLOCKED — "
+                                    f"{target_thread} already told you the "
+                                    f"task is done:\n"
+                                    f"  \"{(wm.get('body') or '')[:200]}\"\n\n"
+                                    f"Do NOT delegate this task again. The "
+                                    f"worker has completed it. If you "
+                                    f"haven't already, SEND_REPLY to the "
+                                    f"user confirming the task is done. "
+                                    f"Then STOP."
                                 )
                                 _deleg_blocked = True
                                 break
+
+                        # Check B — near-duplicate of a recent
+                        # delegation body.
+                        if not _deleg_blocked:
+                            my_prior = [
+                                m for m in worker_thread
+                                if m.get("sender") == agent_name
+                            ][-DELEGATION_LOOKBACK:]
+
+                            for prev in my_prior:
+                                if _similar_text(
+                                    prev.get("body") or "",
+                                    new_body,
+                                    threshold=DELEGATION_DUPLICATE_THRESHOLD,
+                                ):
+                                    logger.warning(
+                                        f"[{agent_name}] delegation suppressed — "
+                                        f"near-duplicate of msg #{prev.get('id')} "
+                                        f"to {target_thread}"
+                                    )
+                                    log_tool_event(
+                                        agent_name, "delegate_suppressed",
+                                        f"dup of #{prev.get('id')} to={target_thread}"
+                                    )
+                                    tail += (
+                                        f"\n\n[SYSTEM] DUPLICATE DELEGATION "
+                                        f"BLOCKED.\n"
+                                        f"You already sent a near-identical "
+                                        f"task to {target_thread} "
+                                        f"(msg #{prev.get('id')}). The worker "
+                                        f"has it.\n\n"
+                                        f"Do NOT re-delegate the same task. "
+                                        f"Instead:\n"
+                                        f"  • If the worker has reported back, "
+                                        f"SEND_REPLY to the user confirming "
+                                        f"what was done.\n"
+                                        f"  • If the worker hasn't reported "
+                                        f"yet, SEND_REPLY to the user saying "
+                                        f"it's in progress.\n"
+                                        f"  • If this is genuinely new work, "
+                                        f"rephrase the body so it isn't a "
+                                        f"duplicate of msg #{prev.get('id')}."
+                                    )
+                                    _deleg_blocked = True
+                                    break
 
             if _deleg_blocked:
                 continue
@@ -731,6 +823,14 @@ def _run_tool(agent_name: str, tool_name: str, tool_args: dict) -> Any:
     """
     cfg = agents.get(agent_name) or {}
     key = (tool_name or "").lower().replace(" ", "_")
+
+    # Remap renamed args so an LLM that learned the old name from
+    # its own tool history still works.
+    if isinstance(tool_args, dict):
+        aliases = _TOOL_ARG_ALIASES.get(key)
+        if aliases:
+            tool_args = {aliases.get(k, k): v for k, v in tool_args.items()}
+
     tool = agents.TOOL_REGISTRY.get(key)
     if tool is None:
         return f"Unknown tool: {tool_name}"

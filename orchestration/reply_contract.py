@@ -17,7 +17,7 @@ Rules
 ─────
 1. Every claimed work class must be present in the ledger.
 2. Work claims require evidence_ids; each ID must exist and match
-   the claimed class.
+   one of the action classes the claim accepts.
 3. Claiming "none" after doing direct work OR delegating → rejected.
 4. Claiming direct work (read/write/execute) when only delegation
    occurred → rejected. (Pure ["delegate"] claims are exempt — that
@@ -26,6 +26,15 @@ Rules
    anything → rejected. Forces the CEO to declare the delegation
    instead of hiding behind "I'm on it".
 6. "none" and "incomplete" cannot be combined with work claims.
+
+Claim → action-class mapping
+────────────────────────────
+A claim may be satisfied by any one of several action classes. The
+important case is `read`: it accepts both READ (file/log reads) and
+QUERY (searches). From the CEO's perspective a web search and a
+file read are the same kind of act — "I looked something up and
+got information back." Distinguishing them in the claim vocabulary
+just creates false rejections.
 
 What is NOT validated here
 ──────────────────────────
@@ -52,14 +61,15 @@ class ClaimedAction(str, Enum):
     INCOMPLETE = "incomplete"  # honest non-claim: failed / waiting / not started
 
 
-# Which ActionClass must be present for each claim.
-# NONE and INCOMPLETE require nothing.
-_REQUIRED: dict[ClaimedAction, ActionClass | None] = {
+# Which ActionClass(es) satisfy each claim. NONE and INCOMPLETE
+# require nothing. The value is a set — a claim passes if the
+# ledger's present-classes intersect the set.
+_REQUIRED: dict[ClaimedAction, set[ActionClass] | None] = {
     ClaimedAction.NONE:       None,
-    ClaimedAction.READ:       ActionClass.READ,
-    ClaimedAction.WRITE:      ActionClass.WRITE,
-    ClaimedAction.EXECUTE:    ActionClass.EXECUTE,
-    ClaimedAction.DELEGATE:   ActionClass.DELEGATE,
+    ClaimedAction.READ:       {ActionClass.READ, ActionClass.QUERY},
+    ClaimedAction.WRITE:      {ActionClass.WRITE},
+    ClaimedAction.EXECUTE:    {ActionClass.EXECUTE},
+    ClaimedAction.DELEGATE:   {ActionClass.DELEGATE},
     ClaimedAction.INCOMPLETE: None,
 }
 
@@ -71,6 +81,16 @@ _DIRECT_WORK_CLAIMS = frozenset({
     ClaimedAction.WRITE,
     ClaimedAction.EXECUTE,
 })
+
+
+def _allowed_for(claims: list[ClaimedAction]) -> set[ActionClass]:
+    """Union of every action class that would satisfy any of `claims`."""
+    allowed: set[ActionClass] = set()
+    for c in claims:
+        req = _REQUIRED.get(c)
+        if req:
+            allowed |= req
+    return allowed
 
 
 def validate(
@@ -113,12 +133,17 @@ def validate(
     present = ledger.classes_present()
 
     # ── Rule 1 — every claimed class must be present this turn ─────
-    missing = {
-        _REQUIRED[c] for c in real
-        if _REQUIRED[c] is not None and _REQUIRED[c] not in present
-    }
+    # A claim passes if any of its allowed action classes is present.
+    # `missing` accumulates the classes the CEO claimed but didn't do,
+    # for the error message.
+    missing: set[ActionClass] = set()
+    for c in real:
+        req = _REQUIRED.get(c)
+        if req is not None and not (req & present):
+            missing |= req
+
     if missing:
-        missing_str = ", ".join(c.value for c in missing)
+        missing_str = ", ".join(sorted(a.value for a in missing))
         return False, (
             f"Claimed {[c.value for c in real]}, but this turn's ledger "
             f"contains no {missing_str} action.\n"
@@ -133,8 +158,10 @@ def validate(
                 f"referencing the call IDs that back it.\n"
                 f"Actual calls this turn:\n{ledger.summary()}"
             )
+
+        allowed = _allowed_for(real)
         by_id = ledger.by_id()
-        allowed = {_REQUIRED[c] for c in real if _REQUIRED[c] is not None}
+
         for eid in evidence_ids:
             if not isinstance(eid, int):
                 return False, (
