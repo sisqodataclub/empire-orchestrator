@@ -1,9 +1,35 @@
-# inbox.py
-"""Thin helpers over InboxDB. Everything in the system talks through here."""
+# orchestration/inbox.py
+"""
+Thin helpers over InboxDB. Everything in the system talks through here.
+
+Loop guard integration
+─────────────────────
+`send()` routes every inter-agent message through LoopGuard before it
+hits the DB. This is the single choke point: delegations, worker
+reports, terminal acks, SEND_REPLY, ASK_CEO, ASK_USER, grace replies,
+and error messages all funnel through `inbox.send`, so a hook here
+catches every leg of any loop.
+
+The guard applies only to inter-agent senders — `"ceo"` and
+`"worker_*"`. User messages (`user_*`) and system messages
+(`__loop_guard__` and any other internal sender) pass through
+untouched.
+
+When the guard blocks a message, `send()` returns a BlockedSend
+object instead of a row id. Callers that need the id must check the
+type. Callers that ignore the return (SEND_REPLY, ASK_CEO, etc.) are
+unaffected — their message simply doesn't reach the DB.
+
+Fail-open: if the guard can't be imported for any reason, delivery
+proceeds normally. A broken guard must not silence the system.
+"""
+import logging
 import os
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from orchestration.inbox_db import InboxDB
+
+logger = logging.getLogger(__name__)
 
 _inbox: Optional[InboxDB] = None
 
@@ -19,10 +45,132 @@ def _db() -> InboxDB:
     return _inbox
 
 
-def send(thread: str, sender: str, body: str,
-         attachments: Optional[List[str]] = None,
-         parent_id: Optional[int] = None) -> int:
-    """Write one row into `thread`, attributed to `sender`."""
+# ══════════════════════════════════════════════════════════════════════
+# Loop guard integration
+# ══════════════════════════════════════════════════════════════════════
+class BlockedSend:
+    """
+    Returned by send() when the loop guard stops a message.
+
+    Carries the Block descriptor from loop_guard so callers can render
+    a useful tool result or log entry without re-querying the guard.
+    """
+    __slots__ = ("block",)
+
+    def __init__(self, block):
+        self.block = block
+
+    def __repr__(self):
+        return f"<BlockedSend reason={self.block.reason}>"
+
+
+def _should_guard(sender: str) -> bool:
+    """
+    Only inter-agent messages pass through the guard. Users and
+    system senders are exempt.
+    """
+    if not sender:
+        return False
+    return sender == "ceo" or sender.startswith("worker_")
+
+
+def _get_guard_or_none():
+    """
+    Lazy import + fail-open. Returns the guard on success, None if
+    the guard module can't be imported. Never raises.
+    """
+    try:
+        from orchestration.loop_guard import get_guard
+        return get_guard()
+    except Exception:
+        logger.exception(
+            "loop_guard: import failed — guard disabled for this send"
+        )
+        return None
+
+
+def _handle_block(sender: str, thread: str, block, guard) -> None:
+    """
+    Log a guard block, and (for non-terminal blocks) notify the user
+    at most once per cooldown.
+
+    Terminal acks are silent — nothing is wrong, the thread is
+    simply finished, and the user doesn't need to hear about it.
+    """
+    # Local import to avoid the module-load circular dependency with
+    # agent_loop (which imports messenger, which imports inbox).
+    try:
+        from orchestration.agent_loop import log_tool_event
+        log_tool_event(
+            sender,
+            "loop_guard_block",
+            f"to={thread} reason={block.reason}",
+        )
+    except Exception:
+        logger.exception("loop_guard: failed to write tool log")
+
+    # Terminal acks: nothing wrong, no user notification.
+    if block.reason == "terminal_ack":
+        return
+
+    # Near/exact repeats: notify the user once per cooldown.
+    if not guard.should_notify_user():
+        return
+
+    org = os.environ.get("ORG_ID")
+    if not org:
+        # Console mode — no user thread to notify.
+        return
+
+    user_thread = f"user_tg_{org}"
+    try:
+        # Direct DB insert, bypassing send() — this is a system
+        # notification, not something the guard should re-check.
+        _db().add_message(
+            thread_id=user_thread,
+            direction="IN",
+            body=(
+                "Heads-up: I paused an agent-to-agent exchange that "
+                "was repeating the same message. No action needed "
+                "unless you want me to look into it."
+            ),
+            sender="__loop_guard__",
+            recipient=user_thread,
+            status="NEW",
+            attachments=None,
+            parent_message_id=None,
+        )
+        logger.info(f"loop_guard: user notified on {user_thread}")
+    except Exception:
+        logger.exception("loop_guard: user notification failed")
+
+
+def send(
+    thread: str,
+    sender: str,
+    body: str,
+    attachments: Optional[List[str]] = None,
+    parent_id: Optional[int] = None,
+) -> Union[int, BlockedSend]:
+    """
+    Write one row into `thread`, attributed to `sender`.
+
+    If the loop guard blocks the message, returns a BlockedSend
+    instead of a row id. Callers that need the id must check the
+    return type.
+    """
+    if _should_guard(sender):
+        guard = _get_guard_or_none()
+        if guard is not None:
+            block = guard.observe(sender, thread, body)
+            if block is not None:
+                logger.warning(
+                    f"[loop-guard] blocked {sender} -> {thread}: "
+                    f"{block.reason}"
+                )
+                _handle_block(sender, thread, block, guard)
+                return BlockedSend(block)
+
     return _db().add_message(
         thread_id=thread,
         direction="IN",
@@ -35,6 +183,9 @@ def send(thread: str, sender: str, body: str,
     )
 
 
+# ══════════════════════════════════════════════════════════════════════
+# Read helpers (unchanged)
+# ══════════════════════════════════════════════════════════════════════
 def recent(thread: str, limit: int = 20) -> List[dict]:
     try:
         return _db().get_thread_history(thread, limit=limit) or []
@@ -83,9 +234,9 @@ def reply_target(agent_name: str, msg: dict) -> str:
 
     Default: back to whoever sent the current message.
 
-    Special case: the CEO receiving a worker report. The report's parent
-    chain leads back to the original user_* message, so the CEO's reply
-    goes to that user — not to the worker.
+    Special case: the CEO receiving a worker report. The report's
+    parent chain leads back to the original user_* message, so the
+    CEO's reply goes to that user — not to the worker.
     """
     sender = msg.get("sender", "") or ""
     if agent_name == "ceo" and sender.startswith("worker_"):

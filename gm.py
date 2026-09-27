@@ -151,6 +151,15 @@ for t in _all_tools:
 
 logger.info(f"Loaded {len(agents.TOOL_REGISTRY)} tools into registry")
 
+# Warm the loop guard's embedding model so the first send_message
+# doesn't stall for 1–2s on the cold start. Safe if the model fails
+# to load — the guard degrades to exact-match only.
+try:
+    from orchestration.loop_guard import warm_model
+    warm_model()
+except Exception:
+    logger.exception("loop_guard: warm_model failed (guard still functional)")
+
 # Note: agent-authored tools are not present in the count above until
 # activate_tool() registers them. After activation, the registry grows
 # in place and every subsequent turn sees the new tool. See

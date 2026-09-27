@@ -46,6 +46,14 @@
 # task it wants to delegate has already been delegated, reported,
 # and confirmed, all inside a single conversation block.
 #
+# The CEO prompt also receives the EARLIER SESSION CONTEXT — a
+# cumulative markdown summary of turns that have aged out of the
+# 12-message inbox window and the 90-minute conversation graph.
+# Maintained by orchestration/session_summary.py. When the summary
+# contains an active task with an Attempts list, the thinking box
+# requires a `checked_attempts` field, so the CEO must declare which
+# prior attempts it has considered before acting.
+#
 # The CEO prompt also includes a "DO NOT RE-DELEGATE" block and
 # agent_loop enforces a hard block in code, so the LLM cannot loop
 # even when it ignores the rule.
@@ -80,6 +88,7 @@ def build_ceo_prompt(
     tool_history: str = "",
     last_reasoning: str = "",
     replies_history: str = "",
+    session_summary: str = "",
 ) -> str:
     """
     Build the CEO's prompt.
@@ -104,6 +113,11 @@ def build_ceo_prompt(
                           counterpart this message came from (user
                           thread or worker thread). Empty on the first
                           turn of a session.
+    session_summary     — cumulative markdown summary of earlier turns
+                          (outside the 12-message window). Empty on
+                          early turns. When it contains an
+                          `### Attempts` section, the thinking box
+                          requires a `checked_attempts` field.
     """
     tool_count = len(tools or [])
 
@@ -309,6 +323,41 @@ Three things to do with this:
   3. If your last "connect" said you'd do X, and you haven't done X
      yet, either do it now or explain in your new thinking box why
      the plan changed.
+
+━━━ EARLIER SESSION CONTEXT ━━━
+A cumulative summary of what happened earlier in this session,
+across all threads. Covers turns that have aged out of the RECENT
+CONVERSATION window above and the conversation graph.
+
+{session_summary or "(no summary yet — this is early in the session)"}
+
+⚠️ ANTI-LOOPING DIRECTIVE
+When the summary contains an `## Active Task` section with a
+non-empty `### Attempts` list, you MUST read it before doing
+anything else this turn.
+
+  • Do NOT repeat any command, check, or approach listed under
+    `### Attempts` with a conclusion other than "inconclusive".
+  • Do NOT retry anything under `### Dead Ends` — those are ruled
+    out by prior evidence.
+  • You MUST fill `checked_attempts` in your thinking box before
+    every CALL_TOOL. List the attempt IDs from `### Attempts` that
+    are relevant to the action you're about to take. If none apply,
+    write ["none-match"] and justify it in your `connect` field.
+  • If every idea you have is already on the attempts list, say so
+    in your reply to the user instead of looping. Being stuck is
+    a valid state to report.
+
+If the summary is empty or has no Active Task section, ignore this
+directive and proceed normally.
+
+If the summary contradicts what you see in the current conversation
+or tool results:
+
+  1. Trust the current evidence, not the summary.
+  2. Note the discrepancy under `dont_know` in your thinking box.
+  3. Mention it in your reply: "The summary says X but I'm seeing Y."
+  4. Do NOT silently continue as if the summary were correct.
 
 ━━━ YOUR RECENT TOOL CALLS ━━━
 {tool_history or "(nothing yet this session)"}
@@ -648,6 +697,13 @@ Required fields:
                 to what you're about to do. "Because X and Y, I'll
                 do Z."
 
+  "checked_attempts" — REQUIRED when the EARLIER SESSION CONTEXT
+                block above contains a non-empty `### Attempts`
+                section. List the attempt IDs (e.g. ["#3", "#7"])
+                from that section that are relevant to the action
+                you are about to take. If none apply, write
+                ["none-match"] and justify it in `connect`.
+
 Example:
 
   "thinking": {{
@@ -699,7 +755,8 @@ Reply with ONE JSON object. No markdown outside it.
     "dont_know": ["...", "..."],
     "need":      ["...", "..."],
     "how":       ["...", "..."],
-    "connect":   "..."
+    "connect":   "...",
+    "checked_attempts": ["#N", "..."]     // required when Attempts present
   }},
   "action_type": "CALL_TOOL | SEND_REPLY | ASK_USER | FINISH",
   "action_payload": {{
@@ -1060,3 +1117,6 @@ Reply with ONE JSON object. No markdown outside it.
 }}
 """
     return prompt
+
+
+

@@ -1,19 +1,27 @@
-#################################################
-
 # orchestration/messenger.py
 """
 Messenger tools.
 
-`send_message` is the delegation tool — writes a row into another agent's
-inbox and ensures that agent's dispatcher is running. Workers don't have
-it. `read_agent_log` reads a worker's tool log for verification.
+`send_message` is the delegation tool — writes a row into another
+agent's inbox and ensures that agent's dispatcher is running.
+Workers don't have it. `read_agent_log` reads a worker's tool log
+for verification.
 
 `send_message` tolerates extra keyword arguments the LLM invents
 (`message_type`, `priority`, etc.) so a hallucinated field does not
 crash the delegation. Ignored args are logged at INFO.
 
-`read_agent_log` prepends a header with the log's last-write timestamp
-and total line count.
+Loop guard
+──────────
+The guard runs inside `inbox.send`, which means every inter-agent
+message passes through it — not just delegations, but also the
+worker's report, the CEO's reply, and so on. When the guard blocks,
+`inbox.send` returns a BlockedSend object. This module detects that
+and renders a clear tool result for the LLM, explaining what
+happened and what to do instead.
+
+The rendered result is short and prescriptive: the LLM reads it as
+the tool's return value and knows not to rephrase and retry.
 """
 import logging
 import os
@@ -22,6 +30,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from orchestration import agents, inbox
+from orchestration.inbox import BlockedSend
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +70,41 @@ def _resolve_target(to: str) -> str:
     return agents.worker_thread_name(to)
 
 
+def _render_blocked_result(target: str, block) -> str:
+    """
+    Turn a BlockedSend into a prescriptive tool result.
+    The LLM reads this and knows not to rephrase and retry.
+    """
+    if block.reason == "terminal_ack":
+        return (
+            f"send_message to {target} skipped — the recipient is "
+            f"signalling the thread is done. Do not send further "
+            f"messages here. If you have something new for the USER, "
+            f"SEND_REPLY. Otherwise FINISH."
+        )
+
+    matched = (block.matched_body or "").replace("\n", " ")[:200]
+    sim = (
+        f" (similarity {block.similarity:.2f})"
+        if block.similarity is not None and block.similarity < 1.0
+        else ""
+    )
+    return (
+        f"send_message to {target} BLOCKED by loop guard: "
+        f"{block.reason}{sim}.\n"
+        f"You already sent a near-identical message "
+        f"{int(block.matched_age_sec)}s ago:\n"
+        f"  \"{matched}\"\n\n"
+        f"Do NOT rephrase and retry — the guard will block that too.\n"
+        f"What to do instead:\n"
+        f"  • If the worker already reported back, SEND_REPLY to the "
+        f"user with what was done.\n"
+        f"  • If you're waiting on the worker, SEND_REPLY saying it's "
+        f"in progress, or FINISH.\n"
+        f"  • Do NOT call send_message to {target} again this turn."
+    )
+
+
 def _send_message(
     to: str,
     body: str,
@@ -73,6 +117,10 @@ def _send_message(
     `**kwargs` absorbs extra fields the LLM invents. Without it, a
     hallucinated field raises TypeError and three of them trip the
     hard-stop.
+
+    The loop guard runs inside inbox.send(). If the message is
+    blocked, the LLM gets a tool result explaining why and what to
+    do instead.
     """
     if kwargs:
         logger.info(
@@ -87,13 +135,24 @@ def _send_message(
 
     target = _resolve_target(to)
 
-    row_id = inbox.send(
+    result = inbox.send(
         thread=target,
         sender=agent_name,
         body=body,
         attachments=attachments,
         parent_id=msg_id,
     )
+
+    # ── Loop guard blocked the message ───────────────────────────────
+    if isinstance(result, BlockedSend):
+        logger.warning(
+            f"[{agent_name}] send_message blocked by loop guard: "
+            f"to={target} reason={result.block.reason}"
+        )
+        return _render_blocked_result(target, result.block)
+    # ── Delivered normally ───────────────────────────────────────────
+
+    row_id = result  # int
 
     if target.startswith("worker_"):
         agents.ensure_worker(target)
@@ -146,7 +205,9 @@ send_message_tool = Tool(
         "Send a message to another agent's inbox and return immediately. "
         "Use for delegation: send_message(to='React Dev', body='...'). "
         "Only 'to', 'body', and optional 'attachments' are accepted; "
-        "other fields are ignored."
+        "other fields are ignored. "
+        "A loop guard blocks repeated or reworded messages to the same "
+        "recipient; if you get a BLOCKED result, do not rephrase and retry."
     ),
     func=_send_message,
 )

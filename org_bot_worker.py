@@ -172,11 +172,14 @@ def _chunk_text(text: str, size: int):
 # ══════════════════════════════════════════════════════════════════════
 def poll_user_thread() -> None:
     """
-    Watch `user_<THREAD_ID>` for rows where sender='ceo' and id > last_seen.
-    Deliver each to the Telegram chat.
+    Watch `user_<THREAD_ID>` for rows where sender is 'ceo' or
+    '__loop_guard__' and id > last_seen. Deliver each to the Telegram
+    chat.
 
     No direction filter — the new inbox writes every row as direction='IN'.
-    Filtering on sender='ceo' is what distinguishes CEO replies.
+    Filtering on sender is what distinguishes replies from other writes.
+    '__loop_guard__' is included so the loop guard's user-facing
+    notification is delivered alongside normal CEO replies.
     """
     # Seed from current max so we don't replay history on boot.
     last_seen = inbox_mod.max_id(USER_THREAD)
@@ -190,7 +193,7 @@ def poll_user_thread() -> None:
             for msg in inbox_mod.since(USER_THREAD, last_seen):
                 last_seen = max(last_seen, int(msg.get("id") or 0))
 
-                if msg.get("sender") != "ceo":
+                if msg.get("sender") not in ("ceo", "__loop_guard__"):
                     continue
 
                 chat_id = getattr(poll_user_thread, "last_chat_id", None)
