@@ -42,6 +42,22 @@ Conversation graph (CEO only):
     conversation shows the delegation, the worker's report, and the
     CEO's confirmation all in one block.
 
+Session summary (CEO only):
+    A cumulative markdown summary of earlier turns, maintained by a
+    background summariser (orchestration/session_summary.py). Covers
+    turns that have aged out of the 12-message inbox window and the
+    90-minute conversation graph. Injected into the CEO prompt as
+    "EARLIER SESSION CONTEXT".
+
+    When the summary contains an active task with an Attempts list,
+    the thinking box requires a `checked_attempts` field so the CEO
+    declares which prior attempts it has considered before acting.
+
+    Updates are fire-and-forget: after every completed turn, a
+    background thread checks whether enough new messages have
+    accumulated to justify a summariser call. Never blocks the
+    dispatcher.
+
 Delegation dedup:
     Before the CEO's send_message to a worker goes through, the
     delegation body is compared against the CEO's last few delegations
@@ -74,6 +90,7 @@ from typing import Any, Optional
 
 import empire_tools
 from orchestration import agents, inbox, messenger, conversations
+from orchestration import session_summary
 from orchestration.turn_ledger import TurnLedger
 from orchestration.reply_contract import ClaimedAction, validate as validate_reply
 from orchestration.thinking import (
@@ -353,6 +370,17 @@ def dispatcher(agent_name: str, start_from: Optional[int] = None) -> None:
                     except Exception:
                         logger.exception(f"[{agent_name}] turn crashed")
                         _write_error(agent_name, msg, "Internal error during turn.")
+                    finally:
+                        # Fire-and-forget session summary update.
+                        # Runs in its own thread; never blocks the
+                        # dispatcher. Dedups against the last
+                        # summarised message ID internally.
+                        try:
+                            session_summary.maybe_update(agent_name)
+                        except Exception:
+                            logger.exception(
+                                f"[{agent_name}] session summary trigger failed"
+                            )
                 last_seen = max(last_seen, int(msg.get("id") or 0))
         except Exception:
             logger.exception(f"[{agent_name}] dispatcher iteration failed")
@@ -399,6 +427,20 @@ def run_agent_turn(agent_name: str, msg: dict) -> None:
     # active conversation, with derived status. Empty for workers.
     conversations_block = _build_conversation_block() if cfg["is_ceo"] else ""
 
+    # Cumulative session summary — CEO only. Covers turns that have
+    # aged out of the 12-message inbox window and the 90-minute
+    # conversation graph. Empty on early turns. When the summary
+    # contains an active task with an Attempts list, the thinking
+    # box requires the `checked_attempts` field this turn.
+    session_summary_block = ""
+    require_checked_attempts = False
+    if cfg["is_ceo"]:
+        try:
+            session_summary_block = session_summary.render_for_prompt(agent_name)
+            require_checked_attempts = session_summary.has_attempts(agent_name)
+        except Exception:
+            logger.exception(f"[{agent_name}] session summary read failed")
+
     if cfg["is_ceo"]:
         prompt = ceo_prompter.build_ceo_prompt(
             user_message=body,
@@ -415,6 +457,7 @@ def run_agent_turn(agent_name: str, msg: dict) -> None:
             tool_history=tool_history,
             last_reasoning=last_reasoning,
             replies_history=replies_history,
+            session_summary=session_summary_block,
         )
     else:
         prompt = ceo_prompter.build_worker_prompt(
@@ -455,7 +498,10 @@ def run_agent_turn(agent_name: str, msg: dict) -> None:
         payload = plan.get("action_payload") or {}
 
         # ── THINKING BOX ─────────────────────────────────────────────
-        think, think_error = parse_thinking(plan)
+        think, think_error = parse_thinking(
+            plan,
+            require_checked_attempts=require_checked_attempts,
+        )
         if think_error:
             logger.info(f"[{agent_name}] thinking box rejected: {think_error}")
             tail += f"\n\n[SYSTEM] {think_error}"
